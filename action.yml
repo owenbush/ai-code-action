@@ -1,0 +1,54 @@
+name: 'AI Code Action'
+description: 'Multi-provider LLM with agentic tool use for GitHub repositories'
+author: 'owenbush'
+
+inputs:
+  prompt:
+    description: 'The task for the LLM'
+    required: true
+  provider:
+    description: 'LLM provider: anthropic, openai, google, mistral, gateway'
+    default: 'anthropic'
+  api-key:
+    description: 'Provider API key'
+    required: true
+  model:
+    description: 'Model identifier (e.g. claude-sonnet-4-6, gpt-4.1, gemini-2.5-pro)'
+  system:
+    description: 'System prompt (overrides the built-in default)'
+  preset:
+    description: 'GitHub tools preset: code-review, issue-triage, repo-explorer, ci-ops, maintainer'
+    default: 'code-review'
+  tools:
+    description: 'Additional tool flags: local-files, shell (comma-separated)'
+  max-steps:
+    description: 'Maximum agentic loop iterations (1-100)'
+    default: '15'
+  comment:
+    description: 'Post result as PR comment'
+    default: 'true'
+  schema:
+    description: 'JSON Schema for structured output'
+  github-token:
+    description: 'GitHub token for API tools and PR comments'
+    default: ${{ github.token }}
+  allow-github-writes:
+    description: 'Allow the model to call GitHub write tools (create comments, issues, etc.). Default false — the model can only read.'
+    default: 'false'
+  allow-shell-on-pr:
+    description: 'Allow the shell tool on pull_request events. Disabled by default because PR content is attacker-controlled on public repos.'
+    default: 'false'
+
+outputs:
+  text:
+    description: "The LLM's final text response"
+  json:
+    description: 'Structured output (when schema provided)'
+
+runs:
+  using: 'node22'
+  main: 'dist/index.js'
+
+branding:
+  icon: 'cpu'
+  color: 'blue'

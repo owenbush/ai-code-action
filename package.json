@@ -1,0 +1,30 @@
+{
+  "name": "ai-code-action",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-provider LLM GitHub Action with agentic tool use",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "ncc build src/main.ts -o dist --source-map --license licenses.txt",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@actions/github": "^9.1.1",
+    "@ai-sdk/anthropic": "^4.0.12",
+    "@ai-sdk/google": "^4.0.12",
+    "@ai-sdk/mistral": "^4.0.8",
+    "@ai-sdk/openai": "^4.0.11",
+    "@github-tools/sdk": "~1.7.0",
+    "ai": "^7.0.21",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@vercel/ncc": "^0.44.1",
+    "typescript": "^5.7.0"
+  }
+}
