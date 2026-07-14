@@ -9,12 +9,25 @@ permissions:
   pull-requests: write
 
 jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npx tsc --noEmit
+
   review:
     runs-on: ubuntu-latest
+    env:
+      HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./
+        if: env.HAS_API_KEY == 'true'
         with:
           provider: anthropic
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
