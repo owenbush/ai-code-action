@@ -23,15 +23,15 @@ jobs:
   review:
     runs-on: ubuntu-latest
     env:
-      HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      HAS_API_KEY: ${{ secrets.MISTRAL_API_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./
         if: env.HAS_API_KEY == 'true'
         with:
-          provider: anthropic
-          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          provider: mistral
+          api-key: ${{ secrets.MISTRAL_API_KEY }}
           preset: code-review
           tools: local-files
           prompt: |
