@@ -25,6 +25,42 @@ export interface AgentLoopResult {
   toolCalls: any[]
 }
 
+const DIFF_NOISE_PATTERNS = [
+  /^diff --git a\/dist\//,
+  /^diff --git a\/.*\.map$/,
+  /^diff --git a\/package-lock\.json/,
+  /^diff --git a\/.*\.d\.ts$/,
+]
+
+function isNoiseFile(diffHeader: string): boolean {
+  return DIFF_NOISE_PATTERNS.some((p) => p.test(diffHeader))
+}
+
+function filterDiff(raw: string, maxLength: number): string {
+  const files = raw.split(/(?=^diff --git )/m)
+  const filtered: string[] = []
+  let length = 0
+
+  for (const file of files) {
+    const firstLine = file.slice(0, file.indexOf('\n'))
+    if (isNoiseFile(firstLine)) continue
+    if (length + file.length > maxLength) {
+      const remaining = maxLength - length
+      if (remaining > 200) {
+        let chunk = file.slice(0, remaining)
+        const lastNewline = chunk.lastIndexOf('\n')
+        if (lastNewline > 0) chunk = chunk.slice(0, lastNewline)
+        filtered.push(chunk)
+      }
+      break
+    }
+    filtered.push(file)
+    length += file.length
+  }
+
+  return filtered.join('')
+}
+
 async function fetchPRContext(githubToken: string): Promise<string | null> {
   const pr = github.context.payload.pull_request
   if (!pr) return null
@@ -33,37 +69,31 @@ async function fetchPRContext(githubToken: string): Promise<string | null> {
     const octokit = github.getOctokit(githubToken)
     const { owner, repo } = github.context.repo
 
-    const [filesRes, diffRes] = await Promise.all([
-      octokit.rest.pulls.listFiles({
-        owner,
-        repo,
-        pull_number: pr.number,
-        per_page: 100,
-      }),
-      octokit.rest.pulls.get({
-        owner,
-        repo,
-        pull_number: pr.number,
-        mediaType: { format: 'diff' },
-      }),
-    ])
+    const allFiles = await octokit.paginate(octokit.rest.pulls.listFiles, {
+      owner,
+      repo,
+      pull_number: pr.number,
+      per_page: 100,
+    })
 
-    const changedFiles = filesRes.data
+    const diffRes = await octokit.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: pr.number,
+      mediaType: { format: 'diff' },
+    })
+
+    const changedFiles = allFiles
       .map((f) => `  ${f.status.charAt(0).toUpperCase()} ${f.filename} (+${f.additions} -${f.deletions})`)
       .join('\n')
 
-    const rawDiff = String(diffRes.data)
-    let diff = rawDiff.slice(0, 30_000)
-    if (diff.length < rawDiff.length) {
-      const lastNewline = diff.lastIndexOf('\n')
-      if (lastNewline > 0) diff = diff.slice(0, lastNewline)
-    }
+    const diff = filterDiff(String(diffRes.data), 30_000)
 
     return [
-      `\n## Changed Files (${filesRes.data.length})`,
+      `\n## Changed Files (${allFiles.length})`,
       changedFiles,
       '',
-      '## Diff (truncated to 30k chars)',
+      '## Diff (filtered, truncated to 30k chars)',
       '```diff',
       diff,
       '```',

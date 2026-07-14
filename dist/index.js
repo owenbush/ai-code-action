@@ -35123,14 +35123,269 @@ const originalStringify = JSON.stringify;
 const originalParse = JSON.parse;
 const customFormat = /^-?\d+n$/;
 
-const bigIntsStringify = /([\[:])?"(-?\d+)n"($|([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
-const noiseStringify =
-  /([\[:])?("-?\d+n+)n("$|"([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
+const bigIntsStringify = /([\[:])?"(-?\d+)n"($|\s*[,\}\]])/g;
+const noiseStringify = /([\[:])?("-?\d+n+)n("$|"\s*[,\}\]])/g;
 
 /**
  * @typedef {(this: any, key: string | number | undefined, value: any) => any} Replacer
  * @typedef {(key: string | number | undefined, value: any, context?: { source: string }) => any} Reviver
  */
+
+/**
+ * Checks if a value is unstringifiable according to native JSON.stringify rules.
+ *
+ * @param {any} val The value to check.
+ * @returns {boolean} True if the value is undefined, a function, or a symbol.
+ */
+const isUnstringifiable = (val) =>
+  val === undefined || typeof val === "function" || typeof val === "symbol";
+
+/**
+ * Checks if a value is a native JSON.rawJSON object (Node.js 22+).
+ *
+ * @param {any} val The value to check.
+ * @returns {boolean} True if the value is a RawJSON instance.
+ */
+const isRawJSON = (val) =>
+  val !== null &&
+  typeof val === "object" &&
+  val.constructor &&
+  val.constructor.name === "RawJSON";
+
+/**
+ * Iteratively converts a JS value to a JSON string.
+ * Used as a fallback when the native JSON.stringify hits the Maximum Call Stack size.
+ * Fully compliant with JSON formatting (space), replacers, and toJSON behaviors.
+ *
+ * @param {any} rootValue The value to stringify.
+ * @param {Replacer | Array<string | number> | null} [replacer] User's custom replacer function.
+ * @param {string | number} [spaceParam] Indentation for pretty-printing.
+ * @returns {string | undefined} The generated JSON string.
+ */
+const stringifyIteratively = (rootValue, replacer, spaceParam) => {
+  let space = "";
+
+  if (typeof spaceParam === "number") {
+    space = " ".repeat(Math.min(10, Math.max(0, Math.floor(spaceParam))));
+  } else if (typeof spaceParam === "string") {
+    space = spaceParam.slice(0, 10);
+  }
+
+  const isFunctionReplacer = typeof replacer === "function";
+  const propertyList = Array.isArray(replacer)
+    ? new Set(replacer.map(String))
+    : null;
+
+  /**
+   * Prepares a value for stringification by resolving toJSON, handling BigInts,
+   * applying custom replacers, and unwrapping primitive objects.
+   *
+   * @param {object|Array} parent The parent object or array holding the value.
+   * @param {string} key The key associated with the value.
+   * @param {any} val The raw value to process.
+   * @returns {any} The processed value ready for stringification.
+   */
+  const prepareVal = (parent, key, val) => {
+    const isObject = val !== null && typeof val === "object";
+    const hasToJSON = isObject && typeof val.toJSON === "function";
+
+    if (hasToJSON) {
+      val = val.toJSON(key);
+    }
+
+    const isNoise = typeof val === "string" && noiseValue.test(val);
+
+    if (isNoise) return val + "n";
+
+    const isBigInt = typeof val === "bigint";
+
+    if (isBigInt) {
+      const supportsRawJSON = "rawJSON" in JSON;
+
+      if (supportsRawJSON) return JSON.rawJSON(val.toString());
+
+      return val.toString() + "n";
+    }
+
+    if (isFunctionReplacer) {
+      val = replacer.call(parent, key, val);
+    }
+
+    const isPostReplacerObject = val !== null && typeof val === "object";
+
+    if (isPostReplacerObject) {
+      const isPrimitiveWrapper =
+        val instanceof Number ||
+        val instanceof String ||
+        val instanceof Boolean;
+
+      if (isPrimitiveWrapper) {
+        val = val.valueOf();
+      }
+    }
+
+    return val;
+  };
+
+  const rootProcessed = prepareVal({ "": rootValue }, "", rootValue);
+
+  if (isUnstringifiable(rootProcessed)) {
+    return undefined;
+  }
+
+  const isRootPrimitive =
+    rootProcessed === null || typeof rootProcessed !== "object";
+  const isRootNativeRawJSON = isRawJSON(rootProcessed);
+
+  if (isRootPrimitive || isRootNativeRawJSON) {
+    return originalStringify(rootProcessed);
+  }
+
+  const chunks = [];
+  let level = 0;
+
+  const stack = [
+    {
+      parent: { "": rootProcessed },
+      key: "",
+      val: rootProcessed,
+      isArray: Array.isArray(rootProcessed),
+      keys: Array.isArray(rootProcessed) ? null : Object.keys(rootProcessed),
+      index: 0,
+      first: true,
+    },
+  ];
+
+  const visited = new WeakSet([rootProcessed]);
+
+  while (stack.length > 0) {
+    const node = stack[stack.length - 1];
+
+    if (node.index === 0) {
+      chunks.push(node.isArray ? "[" : "{");
+      level++;
+    }
+
+    let isDone = false;
+
+    if (node.isArray) {
+      if (node.index < node.val.length) {
+        if (!node.first) chunks.push(",");
+
+        if (space) chunks.push("\n" + space.repeat(level));
+
+        const childRaw = node.val[node.index];
+        const childVal = prepareVal(node.val, String(node.index), childRaw);
+
+        if (isUnstringifiable(childVal)) {
+          chunks.push("null");
+          node.first = false;
+          node.index++;
+        } else {
+          const isComplexObject =
+            childVal !== null && typeof childVal === "object";
+          const isNativeRaw = isRawJSON(childVal);
+
+          if (isComplexObject && !isNativeRaw) {
+            if (visited.has(childVal)) {
+              throw new TypeError("Converting circular structure to JSON");
+            }
+
+            visited.add(childVal);
+
+            stack.push({
+              parent: node.val,
+              key: String(node.index),
+              val: childVal,
+              isArray: Array.isArray(childVal),
+              keys: Array.isArray(childVal) ? null : Object.keys(childVal),
+              index: 0,
+              first: true,
+            });
+
+            node.first = false;
+            node.index++;
+          } else {
+            chunks.push(originalStringify(childVal));
+            node.first = false;
+            node.index++;
+          }
+        }
+      } else {
+        isDone = true;
+      }
+    } else {
+      while (node.index < node.keys.length) {
+        const k = node.keys[node.index++];
+
+        const isFilteredOutByArray = propertyList && !propertyList.has(k);
+
+        if (isFilteredOutByArray) continue;
+
+        const childRaw = node.val[k];
+        const childVal = prepareVal(node.val, k, childRaw);
+
+        if (isUnstringifiable(childVal)) continue;
+
+        if (!node.first) chunks.push(",");
+
+        if (space) {
+          chunks.push("\n" + space.repeat(level) + originalStringify(k) + ": ");
+        } else {
+          chunks.push(originalStringify(k) + ":");
+        }
+
+        const isComplexObject =
+          childVal !== null && typeof childVal === "object";
+        const isNativeRaw = isRawJSON(childVal);
+
+        if (isComplexObject && !isNativeRaw) {
+          if (visited.has(childVal)) {
+            throw new TypeError("Converting circular structure to JSON");
+          }
+
+          visited.add(childVal);
+
+          stack.push({
+            parent: node.val,
+            key: k,
+            val: childVal,
+            isArray: Array.isArray(childVal),
+            keys: Array.isArray(childVal) ? null : Object.keys(childVal),
+            index: 0,
+            first: true,
+          });
+
+          node.first = false;
+
+          break; // Stop current loop level to process the newly pushed stack node
+        } else {
+          chunks.push(originalStringify(childVal));
+          node.first = false;
+        }
+      }
+
+      const isNodeFullyProcessed =
+        node.index >= node.keys.length && stack[stack.length - 1] === node;
+
+      if (isNodeFullyProcessed) {
+        isDone = true;
+      }
+    }
+
+    if (isDone) {
+      level--;
+
+      if (!node.first && space) chunks.push("\n" + space.repeat(level));
+
+      chunks.push(node.isArray ? "]" : "}");
+      visited.delete(node.val);
+      stack.pop();
+    }
+  }
+
+  return chunks.join("");
+};
 
 /**
  * Converts a JavaScript value to a JSON string.
@@ -35143,55 +35398,87 @@ const noiseStringify =
  *
  * @param {*} value The value to convert to a JSON string.
  * @param {Replacer | Array<string | number> | null} [replacer]
- *   A function that alters the behavior of the stringification process,
- *   or an array of strings/numbers to indicate properties to exclude.
+ * A function that alters the behavior of the stringification process,
+ * or an array of strings/numbers to indicate properties to exclude.
  * @param {string | number} [space]
- *   A string or number to specify indentation or pretty-printing.
+ * A string or number to specify indentation or pretty-printing.
  * @returns {string} The JSON string representation.
  */
 const JSONStringify = (value, replacer, space) => {
-  if ("rawJSON" in JSON) {
-    return originalStringify(
+  try {
+    const supportsRawJSON = "rawJSON" in JSON;
+
+    if (supportsRawJSON) {
+      return originalStringify(
+        value,
+        (key, val) => {
+          if (typeof val === "bigint") return JSON.rawJSON(val.toString());
+
+          const hasFunctionReplacer = typeof replacer === "function";
+
+          if (hasFunctionReplacer) return replacer(key, val);
+
+          const isKeyInArrayReplacer =
+            Array.isArray(replacer) && replacer.includes(key);
+
+          if (isKeyInArrayReplacer) return val;
+
+          return val;
+        },
+        space,
+      );
+    }
+
+    if (!value) return originalStringify(value, replacer, space);
+
+    const convertedToCustomJSON = originalStringify(
       value,
-      (key, value) => {
-        if (typeof value === "bigint") return JSON.rawJSON(value.toString());
+      (key, val) => {
+        const isNoise = typeof val === "string" && noiseValue.test(val);
 
-        if (typeof replacer === "function") return replacer(key, value);
+        if (isNoise) return val.toString() + "n"; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
 
-        if (Array.isArray(replacer) && replacer.includes(key)) return value;
+        if (typeof val === "bigint") return val.toString() + "n";
 
-        return value;
+        const hasFunctionReplacer = typeof replacer === "function";
+
+        if (hasFunctionReplacer) return replacer(key, val);
+
+        const isKeyInArrayReplacer =
+          Array.isArray(replacer) && replacer.includes(key);
+
+        if (isKeyInArrayReplacer) return val;
+
+        return val;
       },
       space,
     );
+
+    const processedJSON = convertedToCustomJSON.replace(
+      bigIntsStringify,
+      "$1$2$3",
+    ); // Delete one "n" off the end of every BigInt value
+
+    const denoisedJSON = processedJSON.replace(noiseStringify, "$1$2$3"); // Remove one "n" off the end of every noisy string
+
+    return denoisedJSON;
+  } catch (error) {
+    if (error instanceof RangeError) {
+      const convertedJSON = stringifyIteratively(value, replacer, space);
+
+      if (convertedJSON === undefined) return undefined;
+
+      const supportsRawJSON = "rawJSON" in JSON;
+
+      if (supportsRawJSON) return convertedJSON;
+
+      const processedJSON = convertedJSON.replace(bigIntsStringify, "$1$2$3");
+
+      return processedJSON.replace(noiseStringify, "$1$2$3");
+    }
+
+    throw error;
   }
-
-  if (!value) return originalStringify(value, replacer, space);
-
-  const convertedToCustomJSON = originalStringify(
-    value,
-    (key, value) => {
-      const isNoise = typeof value === "string" && noiseValue.test(value);
-
-      if (isNoise) return value.toString() + "n"; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
-
-      if (typeof value === "bigint") return value.toString() + "n";
-
-      if (typeof replacer === "function") return replacer(key, value);
-
-      if (Array.isArray(replacer) && replacer.includes(key)) return value;
-
-      return value;
-    },
-    space,
-  );
-  const processedJSON = convertedToCustomJSON.replace(
-    bigIntsStringify,
-    "$1$2$3",
-  ); // Delete one "n" off the end of every BigInt value
-  const denoisedJSON = processedJSON.replace(noiseStringify, "$1$2$3"); // Remove one "n" off the end of every noisy string
-
-  return denoisedJSON;
 };
 
 const featureCache = new Map();
@@ -35239,12 +35526,15 @@ const isContextSourceSupported = () => {
 const convertMarkedBigIntsReviver = (key, value, context, userReviver) => {
   const isCustomFormatBigInt =
     typeof value === "string" && customFormat.test(value);
+
   if (isCustomFormatBigInt) return BigInt(value.slice(0, -1));
 
   const isNoiseValue = typeof value === "string" && noiseValue.test(value);
   if (isNoiseValue) return value.slice(0, -1);
 
-  if (typeof userReviver !== "function") return value;
+  const hasUserReviver = typeof userReviver === "function";
+
+  if (!hasUserReviver) return value;
 
   return userReviver(key, value, context);
 };
@@ -35262,15 +35552,18 @@ const convertMarkedBigIntsReviver = (key, value, context, userReviver) => {
  */
 const JSONParseV2 = (text, reviver) => {
   return JSON.parse(text, (key, value, context) => {
-    const isBigNumber =
-      typeof value === "number" &&
-      (value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER);
+    const isNumber = typeof value === "number";
+    const isOutOfBounds =
+      value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER;
+    const isBigNumber = isNumber && isOutOfBounds;
     const isInt = context && intRegex.test(context.source);
     const isBigInt = isBigNumber && isInt;
 
     if (isBigInt) return BigInt(context.source);
 
-    if (typeof reviver !== "function") return value;
+    const hasCustomReviver = typeof reviver === "function";
+
+    if (!hasCustomReviver) return value;
 
     return reviver(key, value, context);
   });
@@ -35283,6 +35576,105 @@ const stringsOrLargeNumbers =
 const noiseValueWithQuotes = /^"-?\d+n+"$/; // Noise - strings that match the custom format before being converted to it
 
 /**
+ * Iteratively traverses the parsed object bottom-up (post-order),
+ * emulating the native JSON.parse reviver behavior.
+ * This avoids Call Stack overflows (RangeError) on deeply nested structures.
+ *
+ * @param {any} parsed The natively parsed JSON object.
+ * @param {Reviver} [userReviver] User's custom reviver function.
+ * @returns {any} The fully processed object.
+ */
+const applyReviverIteratively = (parsed, userReviver) => {
+  const rootHolder = { "": parsed };
+  const stack = [{ parent: rootHolder, key: "", visited: false }];
+
+  while (stack.length > 0) {
+    const node = stack[stack.length - 1];
+
+    if (!node.visited) {
+      node.visited = true;
+
+      const value = node.parent[node.key];
+      const isComplexObject = value !== null && typeof value === "object";
+
+      if (isComplexObject) {
+        const keys = Object.keys(value);
+
+        for (let i = keys.length - 1; i >= 0; i--) {
+          stack.push({ parent: value, key: keys[i], visited: false });
+        }
+      }
+    } else {
+      const { parent, key } = node;
+      let value = parent[key];
+
+      if (typeof value === "string") {
+        const isCustomFormatBigInt = customFormat.test(value);
+
+        if (isCustomFormatBigInt) {
+          value = BigInt(value.slice(0, -1));
+        } else {
+          const isNoise = noiseValue.test(value);
+
+          if (isNoise) value = value.slice(0, -1);
+        }
+      }
+
+      const hasUserReviver = typeof userReviver === "function";
+
+      if (hasUserReviver) {
+        value = userReviver.call(parent, key, value);
+      }
+
+      const isDeleted = value === undefined;
+
+      if (isDeleted) {
+        delete parent[key];
+      } else {
+        parent[key] = value;
+      }
+
+      stack.pop();
+    }
+  }
+
+  return rootHolder[""];
+};
+
+/**
+ * Pre-processes the JSON string to mark large numbers with an 'n' suffix.
+ *
+ * @param {string} text The raw JSON string.
+ * @returns {string} The serialized string with marked BigInts.
+ */
+const serializeBigInts = (text) => {
+  return text.replace(
+    stringsOrLargeNumbers,
+    (match, digits, fractional, exponential) => {
+      const isString = match[0] === '"';
+      const isNoise = isString && noiseValueWithQuotes.test(match);
+
+      if (isNoise) return match.substring(0, match.length - 1) + 'n"'; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
+
+      const hasFractionalOrExponential = fractional || exponential;
+
+      // With a fixed number of digits, we can correctly use lexicographical comparison to do a numeric comparison
+      const isLessThanMaxSafeInt =
+        digits &&
+        (digits.length < MAX_DIGITS ||
+          (digits.length === MAX_DIGITS && digits <= MAX_INT));
+
+      const isStandardValue =
+        isString || hasFractionalOrExponential || isLessThanMaxSafeInt;
+
+      if (isStandardValue) return match;
+
+      return '"' + match + 'n"';
+    },
+  );
+};
+
+/**
  * Converts a JSON string into a JavaScript value.
  *
  * Supports parsing of large integers using two strategies:
@@ -35293,42 +35685,34 @@ const noiseValueWithQuotes = /^"-?\d+n+"$/; // Noise - strings that match the cu
  *
  * @param {string} text A valid JSON string.
  * @param {Reviver} [reviver]
- *   A function that transforms the results. This function is called for each member
- *   of the object. If a member contains nested objects, the nested objects are
- *   transformed before the parent object is.
+ * A function that transforms the results. This function is called for each member
+ * of the object. If a member contains nested objects, the nested objects are
+ * transformed before the parent object is.
  * @returns {any} The parsed JavaScript value.
  * @throws {SyntaxError} If text is not valid JSON.
  */
 const JSONParse = (text, reviver) => {
   if (!text) return originalParse(text, reviver);
 
-  if (isContextSourceSupported()) return JSONParseV2(text, reviver); // Shortcut to a faster (2x) and simpler version
+  try {
+    if (isContextSourceSupported()) return JSONParseV2(text, reviver); // Shortcut to a faster (2x) and simpler version
 
-  // Find and mark big numbers with "n"
-  const serializedData = text.replace(
-    stringsOrLargeNumbers,
-    (text, digits, fractional, exponential) => {
-      const isString = text[0] === '"';
-      const isNoise = isString && noiseValueWithQuotes.test(text);
+    // Find and mark big numbers with "n"
+    const serializedData = serializeBigInts(text);
 
-      if (isNoise) return text.substring(0, text.length - 1) + 'n"'; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
+    return originalParse(serializedData, (key, value, context) =>
+      convertMarkedBigIntsReviver(key, value, context, reviver),
+    );
+  } catch (error) {
+    if (error instanceof RangeError) {
+      const serializedData = serializeBigInts(text);
+      const parsed = originalParse(serializedData);
 
-      const isFractionalOrExponential = fractional || exponential;
-      const isLessThanMaxSafeInt =
-        digits &&
-        (digits.length < MAX_DIGITS ||
-          (digits.length === MAX_DIGITS && digits <= MAX_INT)); // With a fixed number of digits, we can correctly use lexicographical comparison to do a numeric comparison
+      return applyReviverIteratively(parsed, reviver);
+    }
 
-      if (isString || isFractionalOrExponential || isLessThanMaxSafeInt)
-        return text;
-
-      return '"' + text + 'n"';
-    },
-  );
-
-  return originalParse(serializedData, (key, value, context) =>
-    convertMarkedBigIntsReviver(key, value, context, reviver),
-  );
+    throw error;
+  }
 };
 
 
@@ -45896,6 +46280,155 @@ function combineHeaders(...headers) {
   );
 }
 
+// src/remove-undefined-entries.ts
+function removeUndefinedEntries(record) {
+  return Object.fromEntries(
+    Object.entries(record).filter(([_key, value]) => value != null)
+  );
+}
+
+// src/delay.ts
+async function delay(delayInMs, options) {
+  if (delayInMs == null) {
+    return Promise.resolve();
+  }
+  const signal = options == null ? void 0 : options.abortSignal;
+  return new Promise((resolve2, reject) => {
+    if (signal == null ? void 0 : signal.aborted) {
+      reject(createAbortError());
+      return;
+    }
+    const timeoutId = setTimeout(() => {
+      cleanup();
+      resolve2();
+    }, delayInMs);
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+      signal == null ? void 0 : signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(createAbortError());
+    };
+    signal == null ? void 0 : signal.addEventListener("abort", onAbort);
+  });
+}
+function createAbortError() {
+  return new DOMException("Delay was aborted", "AbortError");
+}
+
+// src/websocket.ts
+function getWebSocketConstructor(webSocket) {
+  const WebSocketConstructor = webSocket != null ? webSocket : globalThis.WebSocket;
+  if (WebSocketConstructor == null) {
+    throw new Error("No WebSocket implementation available.");
+  }
+  return WebSocketConstructor;
+}
+function toWebSocketUrl(url) {
+  const wsUrl = new URL(url);
+  if (wsUrl.protocol === "http:") {
+    wsUrl.protocol = "ws:";
+  } else if (wsUrl.protocol === "https:") {
+    wsUrl.protocol = "wss:";
+  }
+  return wsUrl;
+}
+var textDecoder = new TextDecoder();
+async function readWebSocketMessageText(data) {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return textDecoder.decode(data);
+  if (ArrayBuffer.isView(data)) {
+    return textDecoder.decode(data);
+  }
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    return data.text();
+  }
+  return String(data);
+}
+var WEBSOCKET_OPEN_STATE = 1;
+async function waitForWebSocketBufferDrain(socket, {
+  highWaterMark = 1024 * 1024,
+  pollIntervalMs = 20,
+  abortSignal
+} = {}) {
+  var _a2;
+  while (socket.readyState === WEBSOCKET_OPEN_STATE && ((_a2 = socket.bufferedAmount) != null ? _a2 : 0) > highWaterMark) {
+    if ((abortSignal == null ? void 0 : abortSignal.aborted) === true) {
+      return;
+    }
+    await delay(pollIntervalMs);
+  }
+}
+
+// src/connect-to-websocket.ts
+function connectToWebSocket({
+  url,
+  protocols,
+  headers,
+  webSocket,
+  abortSignal,
+  onOpen,
+  onMessageText,
+  onProcessingError,
+  onSocketError,
+  onClose,
+  onAbort
+}) {
+  var _a2;
+  let socket;
+  let abortListener;
+  const close = (code) => {
+    if (abortListener != null) {
+      abortSignal == null ? void 0 : abortSignal.removeEventListener("abort", abortListener);
+      abortListener = void 0;
+    }
+    try {
+      socket == null ? void 0 : socket.close(code);
+    } catch (e) {
+    }
+  };
+  if (abortSignal == null ? void 0 : abortSignal.aborted) {
+    onAbort == null ? void 0 : onAbort((_a2 = abortSignal.reason) != null ? _a2 : new Error("Aborted"));
+    return { socket: void 0, close };
+  }
+  try {
+    const WebSocketConstructor = getWebSocketConstructor(webSocket);
+    socket = new WebSocketConstructor(url, protocols, {
+      headers: removeUndefinedEntries(headers != null ? headers : {})
+    });
+  } catch (error) {
+    onProcessingError(error);
+    return { socket: void 0, close };
+  }
+  if (abortSignal != null && onAbort != null) {
+    abortListener = () => {
+      var _a3;
+      return onAbort((_a3 = abortSignal.reason) != null ? _a3 : new Error("Aborted"));
+    };
+    abortSignal.addEventListener("abort", abortListener, { once: true });
+  }
+  const openedSocket = socket;
+  socket.onopen = () => {
+    try {
+      onOpen == null ? void 0 : onOpen(openedSocket);
+    } catch (error) {
+      onProcessingError(error);
+    }
+  };
+  let tail = Promise.resolve();
+  socket.onmessage = (event) => {
+    tail = tail.then(() => readWebSocketMessageText(event.data)).then((text) => onMessageText(text)).catch(onProcessingError);
+  };
+  socket.onerror = () => {
+    tail = tail.then(() => onSocketError == null ? void 0 : onSocketError()).catch(onProcessingError);
+  };
+  socket.onclose = () => {
+    tail = tail.then(() => onClose == null ? void 0 : onClose()).catch(onProcessingError);
+  };
+  return { socket, close };
+}
+
 // src/convert-async-iterator-to-readable-stream.ts
 function convertAsyncIteratorToReadableStream(iterator) {
   let cancelled = false;
@@ -46020,36 +46553,6 @@ function createToolNameMapping({
       return (_a2 = providerToolNameToCustomToolName[providerToolName]) != null ? _a2 : providerToolName;
     }
   };
-}
-
-// src/delay.ts
-async function delay(delayInMs, options) {
-  if (delayInMs == null) {
-    return Promise.resolve();
-  }
-  const signal = options == null ? void 0 : options.abortSignal;
-  return new Promise((resolve2, reject) => {
-    if (signal == null ? void 0 : signal.aborted) {
-      reject(createAbortError());
-      return;
-    }
-    const timeoutId = setTimeout(() => {
-      cleanup();
-      resolve2();
-    }, delayInMs);
-    const cleanup = () => {
-      clearTimeout(timeoutId);
-      signal == null ? void 0 : signal.removeEventListener("abort", onAbort);
-    };
-    const onAbort = () => {
-      cleanup();
-      reject(createAbortError());
-    };
-    signal == null ? void 0 : signal.addEventListener("abort", onAbort);
-  });
-}
-function createAbortError() {
-  return new DOMException("Delay was aborted", "AbortError");
 }
 
 // src/delayed-promise.ts
@@ -46410,6 +46913,51 @@ function isBrowserRuntime(globalThisAny = globalThis) {
   return globalThisAny.window != null;
 }
 
+// src/is-same-origin.ts
+function isSameOrigin(url, baseUrl) {
+  try {
+    return new URL(url).origin === new URL(baseUrl).origin;
+  } catch (e) {
+    return false;
+  }
+}
+
+// src/sanitize-request-headers.ts
+var BLOCKED_REQUEST_HEADERS = [
+  // Hop-by-hop / transport (RFC 7230 §6.1)
+  "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  // Host / virtual-host routing
+  "host",
+  // Proxy / origin spoofing
+  "forwarded",
+  "proxy-authorization",
+  "via",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-real-ip",
+  // Cloud metadata (GCP, AWS IMDSv1/v2, Azure, Alibaba, DigitalOcean)
+  "metadata",
+  "metadata-flavor",
+  "x-aws-ec2-metadata-token",
+  "x-metadata-token",
+  // Session / cookie
+  "cookie",
+  "set-cookie"
+];
+function sanitizeRequestHeaders(input) {
+  const headers = new Headers(input);
+  for (const name2 of BLOCKED_REQUEST_HEADERS) {
+    headers.delete(name2);
+  }
+  return headers;
+}
+
 // src/validate-download-url.ts
 function validateDownloadUrl(url) {
   let parsed;
@@ -46481,9 +47029,12 @@ function isPrivateIPv4(ip) {
   if (a === 169 && b === 254) return true;
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 0 && c === 0) return true;
+  if (a === 192 && b === 0 && c === 2) return true;
   if (a === 192 && b === 168) return true;
   if (a === 198 && (b === 18 || b === 19)) return true;
-  if (a >= 240) return true;
+  if (a === 198 && b === 51 && c === 100) return true;
+  if (a === 203 && b === 0 && c === 113) return true;
+  if (a >= 224) return true;
   return false;
 }
 function parseIPv6(ip) {
@@ -46531,6 +47082,8 @@ function isPrivateIPv6(ip) {
   if ((groups[0] & 65472) === 65152) return true;
   if ((groups[0] & 65472) === 65216) return true;
   if ((groups[0] & 65280) === 65280) return true;
+  if (groups[0] === 8193 && groups[1] === 3512) return true;
+  if (groups[0] === 16383 && (groups[1] & 61440) === 0) return true;
   const embedsIPv4 = (
     // ::/96 — IPv4-compatible (deprecated)
     topZero(6) || // ::ffff:0:0/96 — IPv4-mapped (ffff in group 5)
@@ -46551,23 +47104,29 @@ function isPrivateIPv6(ip) {
 
 // src/fetch-with-validated-redirects.ts
 var MAX_DOWNLOAD_REDIRECTS = 10;
+var REDIRECT_STATUS_CODES = /* @__PURE__ */ new Set([301, 302, 303, 307, 308]);
 async function fetchWithValidatedRedirects({
   url,
   headers,
   abortSignal,
-  maxRedirects = MAX_DOWNLOAD_REDIRECTS
+  maxRedirects = MAX_DOWNLOAD_REDIRECTS,
+  fetch = globalThis.fetch,
+  trustedOrigin
 }) {
-  const baseInit = { signal: abortSignal };
-  if (headers !== void 0) {
-    baseInit.headers = headers;
-  }
+  let currentHeaders = headers === void 0 ? void 0 : sanitizeRequestHeaders(headers);
+  const perHopInit = (redirect) => {
+    const init = { signal: abortSignal, redirect };
+    if (currentHeaders !== void 0) {
+      init.headers = new Headers(currentHeaders);
+    }
+    return init;
+  };
   let currentUrl = url;
   for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
-    validateDownloadUrl(currentUrl);
-    const response = await fetch(currentUrl, {
-      ...baseInit,
-      redirect: "manual"
-    });
+    if (trustedOrigin === void 0 || !isSameOrigin(currentUrl, trustedOrigin)) {
+      validateDownloadUrl(currentUrl);
+    }
+    const response = await fetch(currentUrl, perHopInit("manual"));
     if (response.type === "opaqueredirect") {
       if (!isBrowserRuntime()) {
         throw new DownloadError({
@@ -46575,12 +47134,19 @@ async function fetchWithValidatedRedirects({
           message: `Redirect from ${currentUrl} could not be validated and was blocked`
         });
       }
-      return await fetch(currentUrl, { ...baseInit, redirect: "follow" });
+      return await fetch(currentUrl, perHopInit("follow"));
     }
     const location = response.headers.get("location");
-    if (response.status >= 300 && response.status < 400 && location) {
+    if (REDIRECT_STATUS_CODES.has(response.status) && location) {
       await cancelResponseBody(response);
-      currentUrl = new URL(location, currentUrl).toString();
+      const nextUrl = new URL(location, currentUrl).toString();
+      if (currentHeaders !== void 0 && !isSameOrigin(nextUrl, currentUrl)) {
+        const userAgent = currentHeaders.get("user-agent");
+        currentHeaders = new Headers(
+          userAgent == null ? void 0 : { "user-agent": userAgent }
+        );
+      }
+      currentUrl = nextUrl;
       continue;
     }
     return response;
@@ -46853,7 +47419,7 @@ function withUserAgentSuffix(headers, ...userAgentSuffixParts) {
 }
 
 // src/version.ts
-var dist_VERSION =  true ? "5.0.7" : 0;
+var dist_VERSION =  true ? "5.0.9" : 0;
 
 // src/get-from-api.ts
 var getOriginalFetch = () => globalThis.fetch;
@@ -46863,16 +47429,27 @@ var getFromApi = async ({
   successfulResponseHandler,
   failedResponseHandler,
   abortSignal,
-  fetch: fetch2 = getOriginalFetch()
+  fetch = getOriginalFetch(),
+  validateUrl,
+  credentialedOrigin,
+  trustedOrigin
 }) => {
   try {
-    const response = await fetch2(url, {
+    const outgoingHeaders = credentialedOrigin !== void 0 && !isSameOrigin(url, credentialedOrigin) ? {} : headers;
+    const requestHeaders = withUserAgentSuffix(
+      outgoingHeaders,
+      `ai-sdk/provider-utils/${dist_VERSION}`,
+      getRuntimeEnvironmentUserAgent()
+    );
+    const response = validateUrl ? await fetchWithValidatedRedirects({
+      url,
+      headers: requestHeaders,
+      abortSignal,
+      fetch,
+      trustedOrigin
+    }) : await fetch(url, {
       method: "GET",
-      headers: withUserAgentSuffix(
-        headers,
-        `ai-sdk/provider-utils/${dist_VERSION}`,
-        getRuntimeEnvironmentUserAgent()
-      ),
+      headers: requestHeaders,
       signal: abortSignal
     });
     const responseHeaders = extractResponseHeaders(response);
@@ -46968,15 +47545,6 @@ function injectJsonInstructionIntoMessages({
 function isBuffer(value) {
   var _a2, _b2;
   return (_b2 = (_a2 = globalThis.Buffer) == null ? void 0 : _a2.isBuffer(value)) != null ? _b2 : false;
-}
-
-// src/is-same-origin.ts
-function isSameOrigin(url, baseUrl) {
-  try {
-    return new URL(url).origin === new URL(baseUrl).origin;
-  } catch (e) {
-    return false;
-  }
 }
 
 // src/is-non-nullable.ts
@@ -48687,7 +49255,7 @@ var postJsonToApi = async ({
   failedResponseHandler,
   successfulResponseHandler,
   abortSignal,
-  fetch: fetch2
+  fetch
 }) => await postToApi({
   url,
   headers: {
@@ -48701,7 +49269,7 @@ var postJsonToApi = async ({
   failedResponseHandler,
   successfulResponseHandler,
   abortSignal,
-  fetch: fetch2
+  fetch
 });
 var postFormDataToApi = async ({
   url,
@@ -48710,7 +49278,7 @@ var postFormDataToApi = async ({
   failedResponseHandler,
   successfulResponseHandler,
   abortSignal,
-  fetch: fetch2
+  fetch
 }) => await postToApi({
   url,
   headers,
@@ -48721,7 +49289,7 @@ var postFormDataToApi = async ({
   failedResponseHandler,
   successfulResponseHandler,
   abortSignal,
-  fetch: fetch2
+  fetch
 });
 var postToApi = async ({
   url,
@@ -48730,10 +49298,10 @@ var postToApi = async ({
   successfulResponseHandler,
   failedResponseHandler,
   abortSignal,
-  fetch: fetch2 = getOriginalFetch2()
+  fetch = getOriginalFetch2()
 }) => {
   try {
-    const response = await fetch2(url, {
+    const response = await fetch(url, {
       method: "POST",
       headers: withUserAgentSuffix(
         headers,
@@ -48885,13 +49453,6 @@ function createProviderExecutedToolFactory({
   });
 }
 
-// src/remove-undefined-entries.ts
-function removeUndefinedEntries(record) {
-  return Object.fromEntries(
-    Object.entries(record).filter(([_key, value]) => value != null)
-  );
-}
-
 // src/resolve.ts
 async function resolve(value) {
   if (typeof value === "function") {
@@ -49022,12 +49583,12 @@ async function retryWithExponentialBackoffInternal(f, {
 
 // src/response-handler.ts
 
-var textDecoder = new TextDecoder();
+var textDecoder2 = new TextDecoder();
 async function readResponseBodyAsText({
   response,
   url
 }) {
-  return textDecoder.decode(
+  return textDecoder2.decode(
     await readResponseWithSizeLimit({
       response,
       url
@@ -49348,34 +49909,150 @@ function stripFileExtension(filename) {
   return firstDotIndex === -1 ? filename : filename.slice(0, firstDotIndex);
 }
 
-// src/websocket.ts
-function getWebSocketConstructor(webSocket) {
-  const WebSocketConstructor = webSocket != null ? webSocket : globalThis.WebSocket;
-  if (WebSocketConstructor == null) {
-    throw new Error("No WebSocket implementation available.");
+// src/transcription-stream-envelope.ts
+var TRANSCRIPTION_STREAM_START_FRAME_TYPE = "transcription-stream.start";
+var TRANSCRIPTION_STREAM_AUDIO_DONE_FRAME_TYPE = "transcription-stream.audio-done";
+function parseTranscriptionStreamClientFrame(text) {
+  let value;
+  try {
+    value = secureJsonParse(text);
+  } catch (e) {
+    return { type: "invalid", message: "malformed JSON" };
   }
-  return WebSocketConstructor;
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return { type: "invalid", message: "frame must be a JSON object" };
+  }
+  const frame = value;
+  if (typeof frame.type !== "string") {
+    return { type: "invalid", message: "frame type must be a string" };
+  }
+  switch (frame.type) {
+    case TRANSCRIPTION_STREAM_START_FRAME_TYPE: {
+      const inputAudioFormat = frame.inputAudioFormat;
+      if (inputAudioFormat == null || typeof inputAudioFormat !== "object" || Array.isArray(inputAudioFormat) || typeof inputAudioFormat.type !== "string") {
+        return {
+          type: "invalid",
+          message: "start frame must have an inputAudioFormat object with a string type"
+        };
+      }
+      if (inputAudioFormat.rate !== void 0 && typeof inputAudioFormat.rate !== "number") {
+        return {
+          type: "invalid",
+          message: "inputAudioFormat.rate must be a number when present"
+        };
+      }
+      if (frame.providerOptions !== void 0 && (frame.providerOptions == null || typeof frame.providerOptions !== "object" || Array.isArray(frame.providerOptions))) {
+        return {
+          type: "invalid",
+          message: "providerOptions must be an object when present"
+        };
+      }
+      if (frame.includeRawChunks !== void 0 && typeof frame.includeRawChunks !== "boolean") {
+        return {
+          type: "invalid",
+          message: "includeRawChunks must be a boolean when present"
+        };
+      }
+      return {
+        type: "start",
+        frame
+      };
+    }
+    case TRANSCRIPTION_STREAM_AUDIO_DONE_FRAME_TYPE:
+      return { type: "audio-done" };
+    default:
+      return { type: "unknown" };
+  }
 }
-function toWebSocketUrl(url) {
-  const wsUrl = new URL(url);
-  if (wsUrl.protocol === "http:") {
-    wsUrl.protocol = "ws:";
-  } else if (wsUrl.protocol === "https:") {
-    wsUrl.protocol = "wss:";
+function serializeTranscriptionStreamPart(part) {
+  try {
+    if (part.type === "error" && isError(part.error)) {
+      return JSON.stringify({
+        ...part,
+        error: { name: part.error.name, message: part.error.message }
+      });
+    }
+    return JSON.stringify(part);
+  } catch (e) {
+    return void 0;
   }
-  return wsUrl;
 }
-var textDecoder2 = new TextDecoder();
-async function readWebSocketMessageText(data) {
-  if (typeof data === "string") return data;
-  if (data instanceof ArrayBuffer) return textDecoder2.decode(data);
-  if (ArrayBuffer.isView(data)) {
-    return textDecoder2.decode(data);
+function isError(value) {
+  return value instanceof Error || Object.prototype.toString.call(value) === "[object Error]";
+}
+function parseTranscriptionStreamPart(text) {
+  let value;
+  try {
+    value = secureJsonParse(text);
+  } catch (e) {
+    return void 0;
   }
-  if (typeof Blob !== "undefined" && data instanceof Blob) {
-    return data.text();
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return void 0;
   }
-  return String(data);
+  const part = value;
+  switch (part.type) {
+    case "stream-start":
+      return Array.isArray(part.warnings) && part.warnings.every(isWarning) ? part : void 0;
+    case "transcript-delta":
+      return isString(part.delta) && isOptional(part.id, isString) && isOptional(part.providerMetadata, dist_isPlainObject) ? part : void 0;
+    case "transcript-partial":
+      return isString(part.text) && isOptional(part.id, isString) && isOptional(part.startSecond, isNumber) && isOptional(part.durationInSeconds, isNumber) && isOptional(part.channelIndex, isNumber) && isOptional(part.providerMetadata, dist_isPlainObject) ? part : void 0;
+    case "transcript-final":
+      return isString(part.text) && isOptional(part.id, isString) && isOptional(part.startSecond, isNumber) && isOptional(part.endSecond, isNumber) && isOptional(part.channelIndex, isNumber) && isOptional(part.providerMetadata, dist_isPlainObject) ? part : void 0;
+    case "finish":
+      return isString(part.text) && Array.isArray(part.segments) && part.segments.every(isSegment) && isOptional(part.language, isString) && isOptional(part.durationInSeconds, isNumber) && isOptional(part.providerMetadata, dist_isPlainObject) ? part : void 0;
+    case "response-metadata": {
+      if (!(isOptional(part.modelId, isString) && isOptional(part.headers, dist_isPlainObject))) {
+        return void 0;
+      }
+      const timestamp = part.timestamp;
+      if (timestamp == null) {
+        return { ...part, timestamp: void 0 };
+      }
+      if (typeof timestamp !== "string") {
+        return void 0;
+      }
+      const revived = new Date(timestamp);
+      return Number.isNaN(revived.getTime()) ? void 0 : { ...part, timestamp: revived };
+    }
+    case "raw":
+      return "rawValue" in part ? part : void 0;
+    case "error":
+      return "error" in part ? part : void 0;
+    default:
+      return void 0;
+  }
+}
+function isString(value) {
+  return typeof value === "string";
+}
+function isNumber(value) {
+  return typeof value === "number";
+}
+function isOptional(value, check) {
+  return value === void 0 || check(value);
+}
+function dist_isPlainObject(value) {
+  return typeof value === "object" && value != null && !Array.isArray(value);
+}
+function isWarning(value) {
+  return dist_isPlainObject(value) && isString(value.type);
+}
+function isSegment(value) {
+  return dist_isPlainObject(value) && isString(value.text) && isNumber(value.startSecond) && isNumber(value.endSecond);
+}
+
+// src/validate-base-url.ts
+
+function validateBaseURL(baseURL) {
+  if ((baseURL == null ? void 0 : baseURL.trim()) === "") {
+    throw new InvalidArgumentError({
+      argument: "baseURL",
+      message: "baseURL must be a non-empty string."
+    });
+  }
+  return baseURL;
 }
 
 // src/without-trailing-slash.ts
@@ -58193,7 +58870,7 @@ function sanitizeJsonSchema(schema) {
   return sanitizeSchema(schema);
 }
 function sanitizeDefinition(definition) {
-  if (typeof definition === "boolean" || !dist_isPlainObject(definition)) {
+  if (typeof definition === "boolean" || !anthropic_dist_isPlainObject(definition)) {
     return definition;
   }
   return sanitizeSchema(definition);
@@ -58302,7 +58979,7 @@ function formatConstraintValue(value) {
   }
   return JSON.stringify(value);
 }
-function dist_isPlainObject(value) {
+function anthropic_dist_isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -61029,6 +61706,7 @@ var AnthropicSkills = class {
   }) {
     const { value: versionResponse } = await getFromApi({
       url: `${this.config.baseURL}/skills/${skillId}/versions/${version}`,
+      validateUrl: false,
       headers,
       failedResponseHandler: anthropicFailedResponseHandler,
       successfulResponseHandler: createJsonResponseHandler(
@@ -61089,13 +61767,15 @@ var AnthropicSkills = class {
 };
 
 // src/version.ts
-var anthropic_dist_VERSION =  true ? "4.0.12" : 0;
+var anthropic_dist_VERSION =  true ? "4.0.14" : 0;
 
 // src/anthropic-provider.ts
 var ANTHROPIC_API_URL = "https://api.anthropic.com";
 var ANTHROPIC_API_VERSIONED_URL = `${ANTHROPIC_API_URL}/v1`;
 function normalizeBaseURL(baseURL) {
-  const baseURLWithoutTrailingSlash = withoutTrailingSlash(baseURL);
+  const baseURLWithoutTrailingSlash = withoutTrailingSlash(
+    validateBaseURL(baseURL)
+  );
   return baseURLWithoutTrailingSlash === ANTHROPIC_API_URL ? ANTHROPIC_API_VERSIONED_URL : baseURLWithoutTrailingSlash;
 }
 function createAnthropic(options = {}) {
@@ -69291,21 +69971,18 @@ function createOpenAIRealtimeTranscriptionStream({
   };
   return new ReadableStream({
     start: (controller) => {
-      const WebSocketConstructor = getWebSocketConstructor(webSocket);
-      const ws = new WebSocketConstructor(
-        url,
-        getOpenAIRealtimeProtocols(headers),
-        { headers }
-      );
+      const realtimeConnection = getOpenAIRealtimeConnection(headers);
       let audioReader;
+      let connection;
       cleanup = (closeCode) => {
-        abortSignal == null ? void 0 : abortSignal.removeEventListener("abort", abort);
-        void (audioReader == null ? void 0 : audioReader.cancel().catch(() => {
-        }));
-        try {
-          ws.close(closeCode);
-        } catch (e) {
+        if (audioReader != null) {
+          void audioReader.cancel().catch(() => {
+          });
+        } else {
+          void audio.cancel().catch(() => {
+          });
         }
+        connection == null ? void 0 : connection.close(closeCode);
       };
       const finishWithError = (error) => {
         if (finished) return;
@@ -69328,42 +70005,42 @@ function createOpenAIRealtimeTranscriptionStream({
         controller.close();
         cleanup(1e3);
       };
-      const abort = () => {
-        var _a;
-        finishWithError((_a = abortSignal == null ? void 0 : abortSignal.reason) != null ? _a : new Error("Aborted"));
-      };
-      if (abortSignal == null ? void 0 : abortSignal.aborted) {
-        abort();
-        return;
-      }
-      abortSignal == null ? void 0 : abortSignal.addEventListener("abort", abort, { once: true });
-      const sendAudio = async () => {
+      const sendAudio = async (socket) => {
         audioReader = audio.getReader();
         try {
           while (true) {
             const { done, value } = await audioReader.read();
             if (done || finished) break;
-            ws.send(
+            socket.send(
               JSON.stringify({
                 type: "input_audio_buffer.append",
                 audio: convertToBase64(value)
               })
             );
+            await waitForWebSocketBufferDrain(socket);
           }
         } finally {
           audioReader.releaseLock();
+          audioReader = void 0;
         }
         if (!finished) {
-          ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+          socket.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
         }
       };
-      ws.onopen = () => {
-        controller.enqueue({ type: "stream-start", warnings });
-        ws.send(JSON.stringify(sessionUpdate));
-        void sendAudio().catch(finishWithError);
-      };
-      ws.onmessage = (event) => {
-        void readWebSocketMessageText(event.data).then(async (text) => {
+      connection = connectToWebSocket({
+        url,
+        protocols: realtimeConnection.protocols,
+        headers: realtimeConnection.headers,
+        webSocket,
+        abortSignal,
+        onAbort: finishWithError,
+        onProcessingError: finishWithError,
+        onOpen: (socket) => {
+          controller.enqueue({ type: "stream-start", warnings });
+          socket.send(JSON.stringify(sessionUpdate));
+          void sendAudio(socket).catch(finishWithError);
+        },
+        onMessageText: async (text) => {
           var _a, _b, _c, _d;
           const parsed = await safeParseJSON({ text });
           if (!parsed.success) return;
@@ -69391,17 +70068,17 @@ function createOpenAIRealtimeTranscriptionStream({
               break;
             }
           }
-        }).catch(finishWithError);
-      };
-      ws.onerror = () => {
-        finishWithError(new Error("OpenAI realtime transcription error"));
-      };
-      ws.onclose = () => {
-        if (finished) return;
-        finished = true;
-        cleanup();
-        controller.close();
-      };
+        },
+        onSocketError: () => {
+          finishWithError(new Error("OpenAI realtime transcription error"));
+        },
+        onClose: () => {
+          if (finished) return;
+          finished = true;
+          cleanup();
+          controller.close();
+        }
+      });
     },
     cancel: () => {
       if (finished) return;
@@ -69438,11 +70115,26 @@ function buildOpenAIRealtimeTranscriptionSession({
     }
   };
 }
-function getOpenAIRealtimeProtocols(headers) {
+function getOpenAIRealtimeConnection(headers) {
   var _a;
-  const authorization = (_a = headers.Authorization) != null ? _a : headers.authorization;
-  const token = (authorization == null ? void 0 : authorization.startsWith("Bearer ")) ? authorization.slice("Bearer ".length) : void 0;
-  return token == null ? ["realtime"] : ["realtime", `openai-insecure-api-key.${token}`];
+  let authorization;
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === "authorization" && value != null) {
+      authorization = value;
+    }
+  }
+  const token = (_a = authorization == null ? void 0 : authorization.match(/^bearer\s+(.+)$/i)) == null ? void 0 : _a[1];
+  if (token == null) {
+    return { protocols: ["realtime"], headers };
+  }
+  return {
+    protocols: ["realtime", `openai-insecure-api-key.${token}`],
+    headers: Object.fromEntries(
+      Object.entries(headers).filter(
+        ([key]) => key.toLowerCase() !== "authorization"
+      )
+    )
+  };
 }
 
 // src/skills/openai-skills.ts
@@ -69525,16 +70217,18 @@ var OpenAISkills = class {
 };
 
 // src/version.ts
-var openai_dist_VERSION =  true ? "4.0.11" : 0;
+var openai_dist_VERSION =  true ? "4.0.13" : 0;
 
 // src/openai-provider.ts
 function createOpenAI(options = {}) {
   var _a, _b;
   const baseURL = (_a = withoutTrailingSlash(
-    loadOptionalSetting({
-      settingValue: options.baseURL,
-      environmentVariableName: "OPENAI_BASE_URL"
-    })
+    validateBaseURL(
+      loadOptionalSetting({
+        settingValue: options.baseURL,
+        environmentVariableName: "OPENAI_BASE_URL"
+      })
+    )
   )) != null ? _a : "https://api.openai.com/v1";
   const providerName = (_b = options.name) != null ? _b : "openai";
   const getHeaders = () => withUserAgentSuffix(
@@ -69672,7 +70366,7 @@ var openai = createOpenAI();
 
 
 // src/version.ts
-var google_dist_VERSION =  true ? "4.0.12" : 0;
+var google_dist_VERSION =  true ? "4.0.14" : 0;
 
 // src/google-embedding-model.ts
 
@@ -72837,6 +73531,7 @@ var GoogleFiles = class {
       await delay(pollIntervalMs);
       const { value: fileStatus } = await getFromApi({
         url: `${this.config.baseURL}/${file.name}`,
+        validateUrl: false,
         headers: combineHeaders(resolvedHeaders),
         successfulResponseHandler: createJsonResponseHandler(
           googleFileResponseSchema
@@ -73125,6 +73820,7 @@ var GoogleVideoModel = class {
       }
       const { value: statusOperation, responseHeaders: pollHeaders } = await getFromApi({
         url: `${this.config.baseURL}/${operationName}`,
+        validateUrl: false,
         headers: combineHeaders(
           await resolve(this.config.headers),
           options.headers
@@ -75377,6 +76073,7 @@ async function pollGoogleInteractionUntilTerminal({
         responseHeaders
       } = await getFromApi({
         url,
+        validateUrl: false,
         headers,
         failedResponseHandler: googleFailedResponseHandler,
         successfulResponseHandler: createJsonResponseHandler(
@@ -75596,6 +76293,7 @@ function streamGoogleInteractionEvents({
   async function openReader() {
     const { value: stream } = await getFromApi({
       url: buildUrl(),
+      validateUrl: false,
       headers: eventSourceHeaders,
       failedResponseHandler: googleFailedResponseHandler,
       successfulResponseHandler: createEventSourceResponseHandler(
@@ -77825,7 +78523,7 @@ var MistralTextEmbeddingResponseSchema = object({
 });
 
 // src/version.ts
-var mistral_dist_VERSION =  true ? "4.0.8" : 0;
+var mistral_dist_VERSION =  true ? "4.0.10" : 0;
 
 // src/mistral-provider.ts
 function createMistral(options = {}) {
@@ -77883,13 +78581,21 @@ var oidc_dist = __nccwpck_require__(2066);
 ;// CONCATENATED MODULE: ./node_modules/@ai-sdk/gateway/dist/index.js
 // src/gateway-realtime-auth.ts
 var GATEWAY_REALTIME_SUBPROTOCOL = "ai-gateway-realtime.v1";
+var GATEWAY_TRANSCRIPTION_SUBPROTOCOL = "ai-gateway-transcription.v1";
 var GATEWAY_AUTH_SUBPROTOCOL_PREFIX = "ai-gateway-auth.";
 var GATEWAY_TEAM_SUBPROTOCOL_PREFIX = "ai-gateway-team.";
 function getGatewayRealtimeProtocols(token, options) {
-  const protocols = [
-    GATEWAY_REALTIME_SUBPROTOCOL,
-    `${GATEWAY_AUTH_SUBPROTOCOL_PREFIX}${token}`
-  ];
+  return buildGatewayProtocols(GATEWAY_REALTIME_SUBPROTOCOL, token, options);
+}
+function getGatewayTranscriptionProtocols(token, options) {
+  return buildGatewayProtocols(
+    GATEWAY_TRANSCRIPTION_SUBPROTOCOL,
+    token,
+    options
+  );
+}
+function buildGatewayProtocols(marker11, token, options) {
+  const protocols = [marker11, `${GATEWAY_AUTH_SUBPROTOCOL_PREFIX}${token}`];
   if (options == null ? void 0 : options.teamIdOrSlug) {
     protocols.push(
       `${GATEWAY_TEAM_SUBPROTOCOL_PREFIX}${encodeSubprotocolValue(options.teamIdOrSlug)}`
@@ -78502,6 +79208,7 @@ var GatewayFetchMetadata = class {
     try {
       const { value } = await getFromApi({
         url: `${this.config.baseURL}/config`,
+        validateUrl: false,
         headers: this.config.headers ? await resolve(this.config.headers) : void 0,
         successfulResponseHandler: createJsonResponseHandler(
           gatewayAvailableModelsResponseSchema
@@ -78522,6 +79229,7 @@ var GatewayFetchMetadata = class {
       const baseUrl = new URL(this.config.baseURL);
       const { value } = await getFromApi({
         url: `${baseUrl.origin}/v1/credits`,
+        validateUrl: false,
         headers: this.config.headers ? await resolve(this.config.headers) : void 0,
         successfulResponseHandler: createJsonResponseHandler(
           gatewayCreditsResponseSchema
@@ -78622,6 +79330,7 @@ var GatewaySpendReport = class {
       }
       const { value } = await getFromApi({
         url: `${baseUrl.origin}/v1/report?${searchParams.toString()}`,
+        validateUrl: false,
         headers: this.config.headers ? await resolve(this.config.headers) : void 0,
         successfulResponseHandler: createJsonResponseHandler(
           gatewaySpendReportResponseSchema
@@ -78700,6 +79409,7 @@ var GatewayGenerationInfoFetcher = class {
       const baseUrl = new URL(this.config.baseURL);
       const { value } = await getFromApi({
         url: `${baseUrl.origin}/v1/generation?id=${encodeURIComponent(params.id)}`,
+        validateUrl: false,
         headers: this.config.headers ? await resolve(this.config.headers) : void 0,
         successfulResponseHandler: createJsonResponseHandler(
           gatewayGenerationInfoResponseSchema
@@ -79660,6 +80370,7 @@ var gatewaySpeechResponseSchema = object({
 // src/gateway-transcription-model.ts
 
 
+
 var GatewayTranscriptionModel = class {
   constructor(modelId, config) {
     this.modelId = modelId;
@@ -79727,6 +80438,41 @@ var GatewayTranscriptionModel = class {
       );
     }
   }
+  async doStream(options) {
+    var _a11, _b11, _c, _d, _e;
+    const currentDate = (_c = (_b11 = (_a11 = this.config._internal) == null ? void 0 : _a11.currentDate) == null ? void 0 : _b11.call(_a11)) != null ? _c : /* @__PURE__ */ new Date();
+    const headers = combineHeaders(
+      await resolve((_d = this.config.headers) != null ? _d : {}),
+      (_e = options.headers) != null ? _e : {},
+      this.getModelConfigHeaders(),
+      await resolve(this.config.o11yHeaders)
+    );
+    const authMethod = await parseAuthMethod(headers);
+    const startFrame = {
+      type: TRANSCRIPTION_STREAM_START_FRAME_TYPE,
+      inputAudioFormat: options.inputAudioFormat,
+      ...options.providerOptions != null && {
+        providerOptions: options.providerOptions
+      },
+      ...options.includeRawChunks != null && {
+        includeRawChunks: options.includeRawChunks
+      }
+    };
+    return {
+      stream: createGatewayTranscriptionStream({
+        webSocket: this.config.webSocket,
+        url: toGatewayTranscriptionUrl(this.config.baseURL, this.modelId),
+        protocols: getProtocolsFromHeaders(headers),
+        headers,
+        startFrame,
+        audio: options.audio,
+        abortSignal: options.abortSignal,
+        authMethod
+      }),
+      request: { body: startFrame },
+      response: { timestamp: currentDate, modelId: this.modelId }
+    };
+  }
   getUrl() {
     return `${this.config.baseURL}/transcription-model`;
   }
@@ -79737,6 +80483,163 @@ var GatewayTranscriptionModel = class {
     };
   }
 };
+function toGatewayTranscriptionUrl(baseURL, modelId) {
+  const url = new URL(`${baseURL.replace(/^http/, "ws")}/transcription-model`);
+  url.searchParams.set("ai-model-id", modelId);
+  return url.toString();
+}
+function getProtocolsFromHeaders(headers) {
+  const normalizedHeaders = normalizeHeaders(headers);
+  const authorization = normalizedHeaders.authorization;
+  const token = (authorization == null ? void 0 : authorization.startsWith("Bearer ")) ? authorization.slice("Bearer ".length) : void 0;
+  return token == null ? [GATEWAY_TRANSCRIPTION_SUBPROTOCOL] : getGatewayTranscriptionProtocols(token, {
+    teamIdOrSlug: normalizedHeaders[VERCEL_AI_GATEWAY_TEAM_HEADER]
+  });
+}
+var MAX_AUDIO_FRAME_BYTES = 64 * 1024;
+function createGatewayTranscriptionStream({
+  webSocket,
+  url,
+  protocols,
+  headers,
+  startFrame,
+  audio,
+  abortSignal,
+  authMethod
+}) {
+  let finished = false;
+  let cleanup = () => {
+  };
+  return new ReadableStream({
+    start: (controller) => {
+      let audioReader;
+      let hasServerErrorPart = false;
+      let lastServerError;
+      let audioStopped = false;
+      let connection;
+      cleanup = (closeCode) => {
+        if (audioReader != null) {
+          void audioReader.cancel().catch(() => {
+          });
+        } else {
+          void audio.cancel().catch(() => {
+          });
+        }
+        connection == null ? void 0 : connection.close(closeCode);
+      };
+      const stopAudio = () => {
+        audioStopped = true;
+        if (audioReader != null) {
+          void audioReader.cancel().catch(() => {
+          });
+          audioReader = void 0;
+        } else {
+          void audio.cancel().catch(() => {
+          });
+        }
+      };
+      const finishWithError = (error) => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        void errorControllerWithGatewayError(controller, error, authMethod);
+      };
+      const sendAudio = async (socket) => {
+        const reader = audio.getReader();
+        audioReader = reader;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done || finished) break;
+            const bytes = typeof value === "string" ? convertBase64ToUint8Array(value) : value;
+            for (let offset = 0; offset < bytes.length; offset += MAX_AUDIO_FRAME_BYTES) {
+              if (finished) break;
+              socket.send(
+                bytes.subarray(offset, offset + MAX_AUDIO_FRAME_BYTES)
+              );
+              await waitForWebSocketBufferDrain(socket);
+            }
+          }
+        } finally {
+          reader.releaseLock();
+          if (audioReader === reader) {
+            audioReader = void 0;
+          }
+        }
+        if (!finished && !audioStopped) {
+          socket.send(
+            JSON.stringify({
+              type: TRANSCRIPTION_STREAM_AUDIO_DONE_FRAME_TYPE
+            })
+          );
+        }
+      };
+      connection = connectToWebSocket({
+        url,
+        protocols,
+        headers,
+        webSocket,
+        abortSignal,
+        onAbort: (reason) => {
+          if (finished) return;
+          finished = true;
+          cleanup();
+          controller.error(reason);
+        },
+        onProcessingError: finishWithError,
+        onOpen: (socket) => {
+          socket.send(JSON.stringify(startFrame));
+          void sendAudio(socket).catch(finishWithError);
+        },
+        // Server frames are envelope-serialized stream parts; the codec
+        // handles parsing, unknown-part skipping, and timestamp revival.
+        onMessageText: (text) => {
+          if (finished) return;
+          const part = parseTranscriptionStreamPart(text);
+          if (part == null) return;
+          if (part.type === "finish") {
+            finished = true;
+            controller.enqueue(part);
+            controller.close();
+            cleanup(1e3);
+            return;
+          }
+          if (part.type === "error") {
+            hasServerErrorPart = true;
+            lastServerError = part.error;
+            stopAudio();
+          }
+          controller.enqueue(part);
+        },
+        onSocketError: () => {
+          finishWithError(
+            new Error("Connection error on AI Gateway transcription stream")
+          );
+        },
+        onClose: () => {
+          if (hasServerErrorPart) {
+            if (finished) return;
+            void createErrorFromServerErrorPart(
+              lastServerError,
+              authMethod
+            ).then(finishWithError);
+            return;
+          }
+          finishWithError(
+            new Error(
+              "AI Gateway transcription stream closed before a finish part was received"
+            )
+          );
+        }
+      });
+    },
+    cancel: () => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+    }
+  });
+}
 var providerMetadataEntrySchema4 = object({}).catchall(unknown());
 var gatewayTranscriptionWarningSchema = discriminatedUnion("type", [
   object({
@@ -79773,6 +80676,36 @@ var gatewayTranscriptionResponseSchema = object({
   warnings: array(gatewayTranscriptionWarningSchema).optional(),
   providerMetadata: record(schemas_string(), providerMetadataEntrySchema4).optional()
 });
+async function errorControllerWithGatewayError(controller, error, authMethod) {
+  controller.error(await asGatewayError(error, authMethod));
+}
+function getServerErrorMessage(error) {
+  if (error != null && typeof error === "object" && "message" in error && typeof error.message === "string") {
+    return error.message;
+  }
+  return getErrorMessage(error);
+}
+var SERVER_ERROR_STATUS_CODES = {
+  authentication_error: 401,
+  failed_dependency: 424,
+  forbidden: 403,
+  internal_server_error: 500,
+  invalid_request_error: 400,
+  model_not_found: 404,
+  rate_limit_exceeded: 429
+};
+async function createErrorFromServerErrorPart(error, authMethod) {
+  if (typeof error === "object" && error != null && "message" in error && typeof error.message === "string" && "type" in error && typeof error.type === "string" && error.type in SERVER_ERROR_STATUS_CODES) {
+    return createGatewayErrorFromResponse({
+      response: { error: { message: error.message, type: error.type } },
+      statusCode: SERVER_ERROR_STATUS_CODES[error.type],
+      authMethod
+    });
+  }
+  return new Error(
+    `AI Gateway transcription stream failed: ${getServerErrorMessage(error)}`
+  );
+}
 
 // src/gateway-realtime-model.ts
 var GatewayRealtimeModel = class {
@@ -80161,7 +81094,7 @@ async function getVercelRequestId() {
 }
 
 // src/version.ts
-var gateway_dist_VERSION =  true ? "4.0.16" : 0;
+var gateway_dist_VERSION =  true ? "4.0.19" : 0;
 
 // src/gateway-provider.ts
 var AI_GATEWAY_PROTOCOL_VERSION = "0.0.1";
@@ -80407,7 +81340,8 @@ function createGateway(options = {}) {
       baseURL,
       headers: getHeaders,
       fetch: options.fetch,
-      o11yHeaders: createO11yHeaders()
+      o11yHeaders: createO11yHeaders(),
+      webSocket: options.webSocket
     });
   };
   provider.transcriptionModel = createTranscriptionModel;
@@ -89559,7 +90493,7 @@ function cloneValue(value) {
 
 
 // src/version.ts
-var ai_dist_VERSION =  true ? "7.0.21" : 0;
+var ai_dist_VERSION =  true ? "7.0.26" : 0;
 
 // src/util/download/download.ts
 var download = async ({
@@ -97481,6 +98415,9 @@ var DefaultStreamTextResult = class {
         var _a23;
         return (_a23 = streamTextTracingChannelContext == null ? void 0 : streamTextTracingChannelContext.run(execute)) != null ? _a23 : execute();
       };
+      const runInTracingChannelSpanInStreamText = telemetryDispatcher.runInTracingChannelSpan == null ? void 0 : (options) => runInStreamTextTracingChannelContext(
+        () => telemetryDispatcher.runInTracingChannelSpan(options)
+      );
       await notify({
         event: startEvent,
         callbacks: [onStart, telemetryDispatcher.onStart]
@@ -97551,7 +98488,7 @@ var DefaultStreamTextResult = class {
                   telemetryDispatcher.onToolExecutionEnd
                 ),
                 executeToolInTelemetryContext: telemetryDispatcher.executeTool,
-                runInTracingChannelSpan: telemetryDispatcher.runInTracingChannelSpan,
+                runInTracingChannelSpan: runInTracingChannelSpanInStreamText,
                 onPreliminaryToolResult: (result2) => {
                   toolExecutionStepStreamController == null ? void 0 : toolExecutionStepStreamController.enqueue(result2);
                 }
@@ -99711,7 +100648,7 @@ async function embedMany({
   experimental_onEnd,
   _internal: { generateCallId = originalGenerateCallId5 } = {}
 }) {
-  var _a22, _b;
+  var _a22;
   const model = resolveEmbeddingModel(modelArg);
   const { maxRetries, retry } = prepareRetries({
     maxRetries: maxRetriesArg,
@@ -99727,112 +100664,33 @@ async function embedMany({
   const telemetryDispatcher = createTelemetryDispatcher({
     telemetry
   });
-  await notify({
-    event: {
-      callId,
-      operationId: "ai.embedMany",
-      provider: model.provider,
-      modelId: model.modelId,
-      value: values,
-      maxRetries,
-      headers: headersWithUserAgent,
-      providerOptions
-    },
-    callbacks: [resolvedOnStart, telemetryDispatcher.onStart]
-  });
-  try {
-    const [maxEmbeddingsPerCall, supportsParallelCalls] = await Promise.all([
-      model.maxEmbeddingsPerCall,
-      model.supportsParallelCalls
-    ]);
-    if (maxEmbeddingsPerCall == null || maxEmbeddingsPerCall === Infinity) {
-      const { embeddings: embeddings2, usage, warnings: warnings2, response, providerMetadata: providerMetadata2 } = await retry(async () => {
-        var _a23, _b2;
-        const embedCallId = generateCallId();
-        await notify({
-          event: {
-            callId,
-            embedCallId,
-            operationId: "ai.embedMany.doEmbed",
-            provider: model.provider,
-            modelId: model.modelId,
-            values
-          },
-          callbacks: [telemetryDispatcher.onEmbedStart]
-        });
-        const modelResponse = await model.doEmbed({
-          values,
-          abortSignal,
-          headers: headersWithUserAgent,
-          providerOptions
-        });
-        const embeddings3 = modelResponse.embeddings;
-        const usage2 = (_a23 = modelResponse.usage) != null ? _a23 : { tokens: NaN };
-        await notify({
-          event: {
-            callId,
-            embedCallId,
-            operationId: "ai.embedMany.doEmbed",
-            provider: model.provider,
-            modelId: model.modelId,
-            values,
-            embeddings: embeddings3,
-            usage: usage2
-          },
-          callbacks: [telemetryDispatcher.onEmbedEnd]
-        });
-        return {
-          embeddings: embeddings3,
-          usage: usage2,
-          warnings: (_b2 = modelResponse.warnings) != null ? _b2 : [],
-          providerMetadata: modelResponse.providerMetadata,
-          response: modelResponse.response
-        };
-      });
-      logWarnings({
-        warnings: warnings2,
-        provider: model.provider,
-        model: model.modelId
-      });
+  const runInTracingChannelSpan = (_a22 = telemetryDispatcher.runInTracingChannelSpan) != null ? _a22 : async ({ execute }) => await execute();
+  const startEvent = {
+    callId,
+    operationId: "ai.embedMany",
+    provider: model.provider,
+    modelId: model.modelId,
+    value: values,
+    maxRetries,
+    headers: headersWithUserAgent,
+    providerOptions
+  };
+  return await runInTracingChannelSpan({
+    type: "embedMany",
+    event: startEvent,
+    execute: async () => {
+      var _a23, _b;
       await notify({
-        event: {
-          callId,
-          operationId: "ai.embedMany",
-          provider: model.provider,
-          modelId: model.modelId,
-          value: values,
-          embedding: embeddings2,
-          usage,
-          warnings: warnings2,
-          providerMetadata: providerMetadata2,
-          response: [response]
-        },
-        callbacks: [resolvedOnEnd, telemetryDispatcher.onEnd]
+        event: startEvent,
+        callbacks: [resolvedOnStart, telemetryDispatcher.onStart]
       });
-      return new DefaultEmbedManyResult({
-        values,
-        embeddings: embeddings2,
-        usage,
-        warnings: warnings2,
-        providerMetadata: providerMetadata2,
-        responses: [response]
-      });
-    }
-    const valueChunks = splitArray(values, maxEmbeddingsPerCall);
-    const embeddings = [];
-    const warnings = [];
-    const responses = [];
-    let tokens = 0;
-    let providerMetadata;
-    const parallelChunks = splitArray(
-      valueChunks,
-      supportsParallelCalls ? maxParallelCalls : 1
-    );
-    for (const parallelChunk of parallelChunks) {
-      const results = await Promise.all(
-        parallelChunk.map((chunk) => {
-          return retry(async () => {
-            var _a23, _b2;
+      try {
+        const [maxEmbeddingsPerCall, supportsParallelCalls] = await Promise.all(
+          [model.maxEmbeddingsPerCall, model.supportsParallelCalls]
+        );
+        if (maxEmbeddingsPerCall == null || maxEmbeddingsPerCall === Infinity) {
+          const { embeddings: embeddings2, usage, warnings: warnings2, response, providerMetadata: providerMetadata2 } = await retry(async () => {
+            var _a24, _b2;
             const embedCallId = generateCallId();
             await notify({
               event: {
@@ -99841,18 +100699,18 @@ async function embedMany({
                 operationId: "ai.embedMany.doEmbed",
                 provider: model.provider,
                 modelId: model.modelId,
-                values: chunk
+                values
               },
               callbacks: [telemetryDispatcher.onEmbedStart]
             });
             const modelResponse = await model.doEmbed({
-              values: chunk,
+              values,
               abortSignal,
               headers: headersWithUserAgent,
               providerOptions
             });
-            const chunkEmbeddings = modelResponse.embeddings;
-            const usage = (_a23 = modelResponse.usage) != null ? _a23 : { tokens: NaN };
+            const embeddings3 = modelResponse.embeddings;
+            const usage2 = (_a24 = modelResponse.usage) != null ? _a24 : { tokens: NaN };
             await notify({
               event: {
                 callId,
@@ -99860,75 +100718,162 @@ async function embedMany({
                 operationId: "ai.embedMany.doEmbed",
                 provider: model.provider,
                 modelId: model.modelId,
-                values: chunk,
-                embeddings: chunkEmbeddings,
-                usage
+                values,
+                embeddings: embeddings3,
+                usage: usage2
               },
               callbacks: [telemetryDispatcher.onEmbedEnd]
             });
             return {
-              embeddings: chunkEmbeddings,
-              usage,
+              embeddings: embeddings3,
+              usage: usage2,
               warnings: (_b2 = modelResponse.warnings) != null ? _b2 : [],
               providerMetadata: modelResponse.providerMetadata,
               response: modelResponse.response
             };
           });
-        })
-      );
-      for (const result of results) {
-        embeddings.push(...result.embeddings);
-        warnings.push(...result.warnings);
-        responses.push(result.response);
-        tokens += result.usage.tokens;
-        if (result.providerMetadata) {
-          if (!providerMetadata) {
-            providerMetadata = { ...result.providerMetadata };
-          } else {
-            for (const [providerName, metadata] of Object.entries(
-              result.providerMetadata
-            )) {
-              providerMetadata[providerName] = {
-                ...(_a22 = providerMetadata[providerName]) != null ? _a22 : {},
-                ...metadata
-              };
+          logWarnings({
+            warnings: warnings2,
+            provider: model.provider,
+            model: model.modelId
+          });
+          await notify({
+            event: {
+              callId,
+              operationId: "ai.embedMany",
+              provider: model.provider,
+              modelId: model.modelId,
+              value: values,
+              embedding: embeddings2,
+              usage,
+              warnings: warnings2,
+              providerMetadata: providerMetadata2,
+              response: [response]
+            },
+            callbacks: [resolvedOnEnd, telemetryDispatcher.onEnd]
+          });
+          return new DefaultEmbedManyResult({
+            values,
+            embeddings: embeddings2,
+            usage,
+            warnings: warnings2,
+            providerMetadata: providerMetadata2,
+            responses: [response]
+          });
+        }
+        const valueChunks = splitArray(values, maxEmbeddingsPerCall);
+        const embeddings = [];
+        const warnings = [];
+        const responses = [];
+        let tokens = 0;
+        let providerMetadata;
+        const parallelChunks = splitArray(
+          valueChunks,
+          supportsParallelCalls ? maxParallelCalls : 1
+        );
+        for (const parallelChunk of parallelChunks) {
+          const results = await Promise.all(
+            parallelChunk.map((chunk) => {
+              return retry(async () => {
+                var _a24, _b2;
+                const embedCallId = generateCallId();
+                await notify({
+                  event: {
+                    callId,
+                    embedCallId,
+                    operationId: "ai.embedMany.doEmbed",
+                    provider: model.provider,
+                    modelId: model.modelId,
+                    values: chunk
+                  },
+                  callbacks: [telemetryDispatcher.onEmbedStart]
+                });
+                const modelResponse = await model.doEmbed({
+                  values: chunk,
+                  abortSignal,
+                  headers: headersWithUserAgent,
+                  providerOptions
+                });
+                const chunkEmbeddings = modelResponse.embeddings;
+                const usage = (_a24 = modelResponse.usage) != null ? _a24 : { tokens: NaN };
+                await notify({
+                  event: {
+                    callId,
+                    embedCallId,
+                    operationId: "ai.embedMany.doEmbed",
+                    provider: model.provider,
+                    modelId: model.modelId,
+                    values: chunk,
+                    embeddings: chunkEmbeddings,
+                    usage
+                  },
+                  callbacks: [telemetryDispatcher.onEmbedEnd]
+                });
+                return {
+                  embeddings: chunkEmbeddings,
+                  usage,
+                  warnings: (_b2 = modelResponse.warnings) != null ? _b2 : [],
+                  providerMetadata: modelResponse.providerMetadata,
+                  response: modelResponse.response
+                };
+              });
+            })
+          );
+          for (const result of results) {
+            embeddings.push(...result.embeddings);
+            warnings.push(...result.warnings);
+            responses.push(result.response);
+            tokens += result.usage.tokens;
+            if (result.providerMetadata) {
+              if (!providerMetadata) {
+                providerMetadata = { ...result.providerMetadata };
+              } else {
+                for (const [providerName, metadata] of Object.entries(
+                  result.providerMetadata
+                )) {
+                  providerMetadata[providerName] = {
+                    ...(_a23 = providerMetadata[providerName]) != null ? _a23 : {},
+                    ...metadata
+                  };
+                }
+              }
             }
           }
         }
+        logWarnings({
+          warnings,
+          provider: model.provider,
+          model: model.modelId
+        });
+        await notify({
+          event: {
+            callId,
+            operationId: "ai.embedMany",
+            provider: model.provider,
+            modelId: model.modelId,
+            value: values,
+            embedding: embeddings,
+            usage: { tokens },
+            warnings,
+            providerMetadata,
+            response: responses
+          },
+          callbacks: [resolvedOnEnd, telemetryDispatcher.onEnd]
+        });
+        return new DefaultEmbedManyResult({
+          values,
+          embeddings,
+          usage: { tokens },
+          warnings,
+          providerMetadata,
+          responses
+        });
+      } catch (error) {
+        await ((_b = telemetryDispatcher.onError) == null ? void 0 : _b.call(telemetryDispatcher, { callId, error }));
+        throw error;
       }
     }
-    logWarnings({
-      warnings,
-      provider: model.provider,
-      model: model.modelId
-    });
-    await notify({
-      event: {
-        callId,
-        operationId: "ai.embedMany",
-        provider: model.provider,
-        modelId: model.modelId,
-        value: values,
-        embedding: embeddings,
-        usage: { tokens },
-        warnings,
-        providerMetadata,
-        response: responses
-      },
-      callbacks: [resolvedOnEnd, telemetryDispatcher.onEnd]
-    });
-    return new DefaultEmbedManyResult({
-      values,
-      embeddings,
-      usage: { tokens },
-      warnings,
-      providerMetadata,
-      responses
-    });
-  } catch (error) {
-    await ((_b = telemetryDispatcher.onError) == null ? void 0 : _b.call(telemetryDispatcher, { callId, error }));
-    throw error;
-  }
+  });
 }
 var DefaultEmbedManyResult = class {
   constructor(options) {
@@ -103009,7 +103954,11 @@ var BrowserRealtimeTransport = class {
   sendRaw(data) {
     var _a22;
     if (((_a22 = this.ws) == null ? void 0 : _a22.readyState) === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
+      if (typeof data === "string" || data instanceof ArrayBuffer || ArrayBuffer.isView(data) || data instanceof Blob) {
+        this.ws.send(data);
+      } else {
+        this.ws.send(JSON.stringify(data));
+      }
     }
   }
   dispose() {
@@ -104313,7 +105262,7 @@ function streamTranscribe({
   if (doStream == null) {
     throw new UnsupportedFunctionalityError4({
       functionality: "streaming transcription",
-      message: `The ${resolvedModel.provider} model "${resolvedModel.modelId}" does not support streaming transcription.` + (typeof model === "string" ? " String model IDs resolve through the global provider (AI Gateway by default), which does not support streaming transcription yet. Pass a provider model instance instead, e.g. openai.transcription('gpt-realtime-whisper')." : "")
+      message: `The ${resolvedModel.provider} model "${resolvedModel.modelId}" does not support streaming transcription.` + (typeof model === "string" ? " String model IDs resolve through the global provider (AI Gateway by default). If that provider does not support streaming transcription, pass a provider model instance instead (e.g. openai.transcription('gpt-realtime-whisper')) or upgrade @ai-sdk/gateway to a version with streaming transcription support." : "")
     });
   }
   const headersWithUserAgent = withUserAgentSuffix11(
@@ -104417,7 +105366,8 @@ function streamTranscribe({
       audio,
       inputAudioFormat,
       providerOptions,
-      abortSignal,
+      // merged so cancelling fullStream also aborts a still-pending doStream
+      abortSignal: mergeAbortSignals(abortSignal, pipeAbortController.signal),
       headers: headersWithUserAgent,
       includeRawChunks
     });
@@ -104432,6 +105382,8 @@ function streamTranscribe({
   })().catch((error) => {
     const reason = error != null ? error : new Error("Transcription stream was cancelled or errored.");
     rejectPendingPromises(reason);
+    audio.cancel(reason).catch(() => {
+    });
     transform.writable.abort(reason).catch(() => {
     });
   });
@@ -105377,6 +106329,39 @@ async function uploadSkill({
 
 
 
+const DIFF_NOISE_PATTERNS = [
+    /^diff --git a\/dist\//,
+    /^diff --git a\/.*\.map$/,
+    /^diff --git a\/package-lock\.json/,
+    /^diff --git a\/.*\.d\.ts$/,
+];
+function isNoiseFile(diffHeader) {
+    return DIFF_NOISE_PATTERNS.some((p) => p.test(diffHeader));
+}
+function filterDiff(raw, maxLength) {
+    const files = raw.split(/(?=^diff --git )/m);
+    const filtered = [];
+    let length = 0;
+    for (const file of files) {
+        const firstLine = file.slice(0, file.indexOf('\n'));
+        if (isNoiseFile(firstLine))
+            continue;
+        if (length + file.length > maxLength) {
+            const remaining = maxLength - length;
+            if (remaining > 200) {
+                let chunk = file.slice(0, remaining);
+                const lastNewline = chunk.lastIndexOf('\n');
+                if (lastNewline > 0)
+                    chunk = chunk.slice(0, lastNewline);
+                filtered.push(chunk);
+            }
+            break;
+        }
+        filtered.push(file);
+        length += file.length;
+    }
+    return filtered.join('');
+}
 async function fetchPRContext(githubToken) {
     const pr = github_context.payload.pull_request;
     if (!pr)
@@ -105384,35 +106369,27 @@ async function fetchPRContext(githubToken) {
     try {
         const octokit = getOctokit(githubToken);
         const { owner, repo } = github_context.repo;
-        const [filesRes, diffRes] = await Promise.all([
-            octokit.rest.pulls.listFiles({
-                owner,
-                repo,
-                pull_number: pr.number,
-                per_page: 100,
-            }),
-            octokit.rest.pulls.get({
-                owner,
-                repo,
-                pull_number: pr.number,
-                mediaType: { format: 'diff' },
-            }),
-        ]);
-        const changedFiles = filesRes.data
+        const allFiles = await octokit.paginate(octokit.rest.pulls.listFiles, {
+            owner,
+            repo,
+            pull_number: pr.number,
+            per_page: 100,
+        });
+        const diffRes = await octokit.rest.pulls.get({
+            owner,
+            repo,
+            pull_number: pr.number,
+            mediaType: { format: 'diff' },
+        });
+        const changedFiles = allFiles
             .map((f) => `  ${f.status.charAt(0).toUpperCase()} ${f.filename} (+${f.additions} -${f.deletions})`)
             .join('\n');
-        const rawDiff = String(diffRes.data);
-        let diff = rawDiff.slice(0, 30_000);
-        if (diff.length < rawDiff.length) {
-            const lastNewline = diff.lastIndexOf('\n');
-            if (lastNewline > 0)
-                diff = diff.slice(0, lastNewline);
-        }
+        const diff = filterDiff(String(diffRes.data), 30_000);
         return [
-            `\n## Changed Files (${filesRes.data.length})`,
+            `\n## Changed Files (${allFiles.length})`,
             changedFiles,
             '',
-            '## Diff (truncated to 30k chars)',
+            '## Diff (filtered, truncated to 30k chars)',
             '```diff',
             diff,
             '```',
