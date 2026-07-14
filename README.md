@@ -108,23 +108,25 @@ By default, GitHub write tools (creating comments, issues, merging PRs, etc.) ar
 
 ## Local tools
 
-Add local file access and shell execution with the `tools` input:
+Add local file access, write capabilities, git operations, and shell execution with the `tools` input:
 
 ```yaml
 - uses: owenbush/ai-code-action@v1
   with:
     provider: anthropic
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-    tools: local-files
-    prompt: "Read the test files and suggest missing test cases"
+    tools: local-files,local-write,git
+    prompt: "Fix the typo in README.md and commit the change"
 ```
 
 | Flag | Tools added | Description |
 |------|-------------|-------------|
 | `local-files` | `read_file`, `list_directory`, `search_files` | Read and search the checked-out repo |
+| `local-write` | `write_file`, `create_directory` | Write files and create directories in the repo |
+| `git` | `git_diff`, `git_commit_and_push` | View diffs, commit changes, and push to the current branch |
 | `shell` | `run_command` | Execute shell commands (tests, linters, builds) |
 
-Combine them: `tools: local-files,shell`
+Combine them: `tools: local-files,local-write,git,shell`
 
 ## Security
 
@@ -135,6 +137,12 @@ The `run_command` tool gives the LLM full `bash -c` access in the workspace. Com
 **On `pull_request` events, shell is disabled by default** because PR content (title, body, diff) is auto-injected into the system prompt and is attacker-controlled on public repos. A malicious PR could instruct the model to run arbitrary commands. Set `allow-shell-on-pr: true` only if you understand this risk and have mitigations in place (e.g. private repo, restricted runner, no secrets in the environment).
 
 For non-PR events (e.g. `workflow_dispatch`, `schedule`), shell is allowed but you should still avoid passing untrusted input as the `prompt`.
+
+### Write and git tools
+
+The `local-write` and `git` tool flags let the model modify files and push commits. All file operations are sandboxed to the workspace directory — paths that escape the checkout are rejected. The `git_commit_and_push` tool stages only the files the model specifies, never `git add -A`.
+
+These flags are safe on non-PR events (e.g. `workflow_dispatch`, `schedule`) where the prompt is trusted. **Avoid enabling them on `pull_request` events** for public repos — a malicious diff could instruct the model to overwrite files or push unwanted commits.
 
 ### GitHub write tools
 
@@ -261,6 +269,30 @@ jobs:
           prompt: "Run the test suite and analyze any failures. Suggest fixes."
 ```
 
+### Auto-fix and commit (non-PR event)
+
+```yaml
+name: Auto-fix
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: owenbush/ai-code-action@v1
+        with:
+          provider: anthropic
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          tools: local-files,local-write,git
+          comment: false
+          prompt: "Fix any linting errors in src/ and commit the changes"
+```
+
 ## Inputs
 
 | Input | Required | Default | Description |
@@ -271,7 +303,7 @@ jobs:
 | `model` | | provider default | Model identifier |
 | `system` | | built-in | System prompt override |
 | `preset` | | `code-review` | GitHub tools preset |
-| `tools` | | — | `local-files`, `shell` (comma-separated) |
+| `tools` | | — | `local-files`, `local-write`, `git`, `shell` (comma-separated) |
 | `max-steps` | | `15` | Maximum agentic loop iterations (1-100) |
 | `comment` | | `true` | Post result as PR comment |
 | `schema` | | — | JSON Schema for structured output |

@@ -88290,6 +88290,98 @@ const searchFiles = tool({
     },
 });
 
+;// CONCATENATED MODULE: ./src/tools/write-file.ts
+
+
+
+
+
+const write_file_writeFile = tool({
+    description: 'Write content to a file in the repository. Creates the file if it does not exist, overwrites if it does. Parent directories are created automatically.',
+    inputSchema: object({
+        path: schemas_string().describe('Relative path to the file from the repo root'),
+        content: schemas_string().describe('The full content to write to the file'),
+    }),
+    execute: async ({ path: filePath, content }) => {
+        const resolved = safePath(filePath);
+        await promises_default().mkdir(external_node_path_default().dirname(resolved), { recursive: true });
+        await promises_default().writeFile(resolved, content, 'utf-8');
+        return `Wrote ${content.length} bytes to ${filePath}`;
+    },
+});
+const createDirectory = tool({
+    description: 'Create a directory in the repository. Creates parent directories automatically if needed.',
+    inputSchema: object({
+        path: schemas_string()
+            .describe('Relative directory path from the repo root'),
+    }),
+    execute: async ({ path: dirPath }) => {
+        const resolved = safePath(dirPath);
+        await promises_default().mkdir(resolved, { recursive: true });
+        return `Created directory ${dirPath}`;
+    },
+});
+
+;// CONCATENATED MODULE: ./src/tools/git.ts
+
+
+
+
+
+const git_execFileAsync = (0,external_node_util_.promisify)(external_node_child_process_namespaceObject.execFile);
+async function git(...args) {
+    return git_execFileAsync('git', args, {
+        cwd: workspace,
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+    });
+}
+const gitDiff = tool({
+    description: 'Show the git diff for the current working tree or between refs. Useful for seeing what files have changed and what the changes are.',
+    inputSchema: object({
+        ref: schemas_string()
+            .optional()
+            .describe('Git ref to diff against (e.g. "HEAD", "main", "HEAD~1"). Omit for unstaged changes.'),
+        nameOnly: schemas_boolean()
+            .default(false)
+            .describe('If true, only list changed file names (no content diff)'),
+        path: schemas_string()
+            .optional()
+            .describe('Restrict diff to a specific file or directory'),
+    }),
+    execute: async ({ ref, nameOnly, path: diffPath }) => {
+        const args = ['diff'];
+        if (nameOnly)
+            args.push('--name-only');
+        if (ref)
+            args.push(ref);
+        if (diffPath) {
+            args.push('--', diffPath);
+        }
+        const { stdout } = await git(...args);
+        return stdout || 'No changes.';
+    },
+});
+const gitCommitAndPush = tool({
+    description: 'Stage files, create a git commit, and push to the current branch. Use this to save changes back to the repository.',
+    inputSchema: object({
+        files: array(schemas_string())
+            .describe('Relative file paths to stage (e.g. [".decodie/entry-1.json"]). Use ["."] to stage all changes.'),
+        message: schemas_string().describe('Commit message'),
+    }),
+    execute: async ({ files, message }) => {
+        await git('add', ...files);
+        const { stdout: status } = await git('status', '--porcelain');
+        if (!status.trim()) {
+            return 'Nothing to commit — no staged changes.';
+        }
+        await git('commit', '-m', message);
+        const { stdout: branch } = await git('rev-parse', '--abbrev-ref', 'HEAD');
+        await git('push', 'origin', branch.trim());
+        return `Committed and pushed to ${branch.trim()}: ${message}`;
+    },
+});
+
 ;// CONCATENATED MODULE: ./src/tools/run-command.ts
 
 
@@ -88340,6 +88432,8 @@ const runCommand = tool({
 
 
 
+
+
 const VALID_PRESETS = new Set([
     'code-review',
     'issue-triage',
@@ -88347,15 +88441,28 @@ const VALID_PRESETS = new Set([
     'ci-ops',
     'maintainer',
 ]);
-const LOCAL_FILE_TOOLS = {
+const LOCAL_READ_TOOLS = {
     read_file: readFile,
     list_directory: listDirectory,
     search_files: searchFiles,
 };
+const LOCAL_WRITE_TOOLS = {
+    write_file: write_file_writeFile,
+    create_directory: createDirectory,
+};
+const GIT_TOOLS = {
+    git_diff: gitDiff,
+    git_commit_and_push: gitCommitAndPush,
+};
 const SHELL_TOOLS = {
     run_command: runCommand,
 };
-const VALID_FLAGS = new Set(['local-files', 'shell']);
+const VALID_FLAGS = new Set([
+    'local-files',
+    'local-write',
+    'git',
+    'shell',
+]);
 const WRITE_TOOL_NAMES = new Set(Object.keys(GITHUB_WRITE_TOOLS));
 function resolveTools(token, preset, toolFlags, allowGithubWrites) {
     if (!VALID_PRESETS.has(preset)) {
@@ -88377,7 +88484,13 @@ function resolveTools(token, preset, toolFlags, allowGithubWrites) {
         tools[name] = t;
     }
     if (toolFlags.includes('local-files')) {
-        tools = { ...tools, ...LOCAL_FILE_TOOLS };
+        tools = { ...tools, ...LOCAL_READ_TOOLS };
+    }
+    if (toolFlags.includes('local-write')) {
+        tools = { ...tools, ...LOCAL_WRITE_TOOLS };
+    }
+    if (toolFlags.includes('git')) {
+        tools = { ...tools, ...GIT_TOOLS };
     }
     if (toolFlags.includes('shell')) {
         tools = { ...tools, ...SHELL_TOOLS };

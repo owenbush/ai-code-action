@@ -20,7 +20,7 @@ inputs:
     description: 'GitHub tools preset: code-review, issue-triage, repo-explorer, ci-ops, maintainer'
     default: 'code-review'
   tools:
-    description: 'Additional tool flags: local-files, shell (comma-separated)'
+    description: 'Additional tool flags: local-files, local-write, git, shell (comma-separated)'
   max-steps:
     description: 'Maximum agentic loop iterations (1-100)'
     default: '15'
