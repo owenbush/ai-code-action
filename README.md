@@ -108,23 +108,25 @@ By default, GitHub write tools (creating comments, issues, merging PRs, etc.) ar
 
 ## Local tools
 
-Add local file access and shell execution with the `tools` input:
+Add local file access, write capabilities, git operations, and shell execution with the `tools` input:
 
 ```yaml
 - uses: owenbush/ai-code-action@v1
   with:
     provider: anthropic
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-    tools: local-files
-    prompt: "Read the test files and suggest missing test cases"
+    tools: local-files,local-write,git
+    prompt: "Fix the typo in README.md and commit the change"
 ```
 
 | Flag | Tools added | Description |
 |------|-------------|-------------|
-| `local-files` | `read_file`, `list_directory`, `search_files` | Read and search the checked-out repo |
+| `local-files` | `read_file`, `list_directory`, `search_files`, `git_diff` | Read, search, and diff the checked-out repo |
+| `local-write` | `write_file`, `create_directory` | Write files and create directories in the repo |
+| `git` | `git_commit_and_push` (+ `git_diff` if `local-files` not set) | Commit changes and push to the current branch |
 | `shell` | `run_command` | Execute shell commands (tests, linters, builds) |
 
-Combine them: `tools: local-files,shell`
+`local-files` is read-only and safe on PR events. `local-write` and `git` are gated on PR events (see Security). Combine them: `tools: local-files,local-write,git,shell`
 
 ## Security
 
@@ -136,6 +138,16 @@ The `run_command` tool gives the LLM full `bash -c` access in the workspace. Com
 
 For non-PR events (e.g. `workflow_dispatch`, `schedule`), shell is allowed but you should still avoid passing untrusted input as the `prompt`.
 
+### Write and git tools
+
+The `local-write` and `git` tool flags let the model modify files and push commits. All file operations are sandboxed to the workspace directory — paths that escape the checkout are rejected, including paths that traverse symlinks pointing outside the workspace. The `git_commit_and_push` tool uses `git add -- <files>` to stage only the paths the model specifies — flags like `-A` or `--all` are treated as pathspecs, not options. File paths in git tools are also validated through the workspace sandbox.
+
+`git_diff` is a read-only tool included with `local-files` — it works on PR events without `allow-write-on-pr`. The `git` flag adds only `git_commit_and_push` (the write operation).
+
+**On `pull_request` and `issue_comment` events, write and git tools are disabled by default** — PR content is attacker-controlled on public repos, and `git_commit_and_push` persists changes to the remote. Set `allow-write-on-pr: true` only if you understand this risk (e.g. private repo, restricted runner).
+
+Note: `allow-github-writes` controls GitHub API write tools (comments, issues, labels). The `git` tool flag is a separate write path that pushes commits directly via git. If you set `allow-github-writes: false` but enable `tools: git`, the model can still mutate the repo through commits. The action logs a warning when this happens.
+
 ### GitHub write tools
 
 By default, GitHub write tools are excluded entirely — the model never sees them. Set `allow-github-writes: true` to let the model create comments, issues, labels, etc. via the GitHub API. On public repos with PR triggers, this opens the same prompt injection vector — a malicious diff could instruct the model to post spam or close issues.
@@ -143,6 +155,10 @@ By default, GitHub write tools are excluded entirely — the model never sees th
 ### Secrets
 
 The runner environment may contain secrets (`ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, etc.). With `shell` enabled, a command like `env` could surface these as tool output, which flows into the model response and could be posted as a PR comment. GitHub's log masking does not cover PR comment bodies. Use scoped tokens with minimal permissions and avoid `shell` on public repos.
+
+### Fork PRs and git tools
+
+On fork PRs, `git_commit_and_push` refuses to push — `origin` points to the base repo, not the fork, so a push would create/overwrite a branch in the trusted repository. The commit is created locally but not pushed, and the tool returns an error explaining why.
 
 ### `pull_request_target`
 
@@ -261,6 +277,30 @@ jobs:
           prompt: "Run the test suite and analyze any failures. Suggest fixes."
 ```
 
+### Auto-fix and commit (non-PR event)
+
+```yaml
+name: Auto-fix
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: owenbush/ai-code-action@v1
+        with:
+          provider: anthropic
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          tools: local-files,local-write,git
+          comment: false
+          prompt: "Fix any linting errors in src/ and commit the changes"
+```
+
 ## Inputs
 
 | Input | Required | Default | Description |
@@ -271,12 +311,13 @@ jobs:
 | `model` | | provider default | Model identifier |
 | `system` | | built-in | System prompt override |
 | `preset` | | `code-review` | GitHub tools preset |
-| `tools` | | — | `local-files`, `shell` (comma-separated) |
+| `tools` | | — | `local-files`, `local-write`, `git`, `shell` (comma-separated) |
 | `max-steps` | | `15` | Maximum agentic loop iterations (1-100) |
 | `comment` | | `true` | Post result as PR comment |
 | `schema` | | — | JSON Schema for structured output |
 | `github-token` | | `${{ github.token }}` | GitHub token |
 | `allow-github-writes` | | `false` | Allow model-initiated GitHub API writes |
+| `allow-write-on-pr` | | `false` | Allow local-write and git tools on pull_request events |
 | `allow-shell-on-pr` | | `false` | Allow shell tool on pull_request events |
 
 ## Outputs

@@ -20,7 +20,7 @@ inputs:
     description: 'GitHub tools preset: code-review, issue-triage, repo-explorer, ci-ops, maintainer'
     default: 'code-review'
   tools:
-    description: 'Additional tool flags: local-files, shell (comma-separated)'
+    description: 'Additional tool flags: local-files, local-write, git, shell (comma-separated)'
   max-steps:
     description: 'Maximum agentic loop iterations (1-100)'
     default: '15'
@@ -35,8 +35,11 @@ inputs:
   allow-github-writes:
     description: 'Allow the model to call GitHub write tools (create comments, issues, etc.). Default false — the model can only read.'
     default: 'false'
+  allow-write-on-pr:
+    description: 'Allow local-write and git tools on pull_request and issue_comment events. Disabled by default because PR content is attacker-controlled on public repos — a malicious diff could instruct the model to overwrite files or push commits.'
+    default: 'false'
   allow-shell-on-pr:
-    description: 'Allow the shell tool on pull_request events. Disabled by default because PR content is attacker-controlled on public repos.'
+    description: 'Allow the shell tool on pull_request and issue_comment events. Disabled by default because PR content is attacker-controlled on public repos.'
     default: 'false'
 
 outputs:
@@ -46,7 +49,7 @@ outputs:
     description: 'Structured output (when schema provided)'
 
 runs:
-  using: 'node22'
+  using: 'node24'
   main: 'dist/index.js'
 
 branding:

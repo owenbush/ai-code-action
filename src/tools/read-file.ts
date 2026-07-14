@@ -10,7 +10,7 @@ export const readFile = tool({
     path: z.string().describe('Relative path to the file from the repo root'),
   }),
   execute: async ({ path: filePath }) => {
-    const resolved = safePath(filePath)
+    const resolved = await safePath(filePath)
     const content = await fs.readFile(resolved, 'utf-8')
     return content
   },

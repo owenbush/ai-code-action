@@ -25,7 +25,71 @@ export interface AgentLoopResult {
   toolCalls: any[]
 }
 
-async function fetchPRContext(githubToken: string): Promise<string | null> {
+const DIFF_NOISE_PATTERNS = [
+  /^diff --git a\/dist\//,
+  /^diff --git a\/.*\.map$/,
+  /^diff --git a\/package-lock\.json/,
+  /^diff --git a\/.*\.d\.ts$/,
+]
+
+function isNoiseFile(diffHeader: string): boolean {
+  return DIFF_NOISE_PATTERNS.some((p) => p.test(diffHeader))
+}
+
+interface FilterResult {
+  text: string
+  noiseFiltered: string[]
+  lengthTruncated: boolean
+}
+
+function extractFileName(diffHeader: string): string {
+  const match = diffHeader.match(/^diff --git a\/(.+?) b\//)
+  return match ? match[1] : diffHeader
+}
+
+function filterDiff(raw: string, maxLength: number): FilterResult {
+  const files = raw.split(/(?=^diff --git )/m)
+  const filtered: string[] = []
+  const noiseFiltered: string[] = []
+  let length = 0
+  let lengthTruncated = false
+
+  for (const file of files) {
+    const firstLine = file.slice(0, file.indexOf('\n'))
+    if (isNoiseFile(firstLine)) {
+      noiseFiltered.push(extractFileName(firstLine))
+      continue
+    }
+    if (length + file.length > maxLength) {
+      lengthTruncated = true
+      const remaining = maxLength - length
+      if (remaining > 200) {
+        let chunk = file.slice(0, remaining)
+        const lastNewline = chunk.lastIndexOf('\n')
+        if (lastNewline > 0) chunk = chunk.slice(0, lastNewline)
+        filtered.push(chunk)
+      }
+      break
+    }
+    filtered.push(file)
+    length += file.length
+  }
+
+  return { text: filtered.join(''), noiseFiltered, lengthTruncated }
+}
+
+const MAX_FILE_LIST = 300
+
+interface PRContext {
+  fileList: string
+  fileCount: number
+  fileListTruncated: boolean
+  diffPreview: string
+  noiseFiltered: string[]
+  lengthTruncated: boolean
+}
+
+async function fetchPRContext(githubToken: string): Promise<PRContext | null> {
   const pr = github.context.payload.pull_request
   if (!pr) return null
 
@@ -33,48 +97,40 @@ async function fetchPRContext(githubToken: string): Promise<string | null> {
     const octokit = github.getOctokit(githubToken)
     const { owner, repo } = github.context.repo
 
-    const [filesRes, diffRes] = await Promise.all([
-      octokit.rest.pulls.listFiles({
-        owner,
-        repo,
-        pull_number: pr.number,
-        per_page: 100,
-      }),
-      octokit.rest.pulls.get({
-        owner,
-        repo,
-        pull_number: pr.number,
-        mediaType: { format: 'diff' },
-      }),
-    ])
+    const allFiles = await octokit.paginate(octokit.rest.pulls.listFiles, {
+      owner,
+      repo,
+      pull_number: pr.number,
+      per_page: 100,
+    })
 
-    const changedFiles = filesRes.data
+    const diffRes = await octokit.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: pr.number,
+      mediaType: { format: 'diff' },
+    })
+
+    const displayed = allFiles.slice(0, MAX_FILE_LIST)
+    const fileListTruncated = allFiles.length > MAX_FILE_LIST
+    const fileList = displayed
       .map((f) => `  ${f.status.charAt(0).toUpperCase()} ${f.filename} (+${f.additions} -${f.deletions})`)
       .join('\n')
 
     const rawDiff = String(diffRes.data)
-    let diff = rawDiff.slice(0, 30_000)
-    if (diff.length < rawDiff.length) {
-      const lastNewline = diff.lastIndexOf('\n')
-      if (lastNewline > 0) diff = diff.slice(0, lastNewline)
-    }
+    const { text: diffPreview, noiseFiltered, lengthTruncated } = filterDiff(rawDiff, 30_000)
 
-    return [
-      `\n## Changed Files (${filesRes.data.length})`,
-      changedFiles,
-      '',
-      '## Diff (truncated to 30k chars)',
-      '```diff',
-      diff,
-      '```',
-    ].join('\n')
+    return { fileList, fileCount: allFiles.length, fileListTruncated, diffPreview, noiseFiltered, lengthTruncated }
   } catch (err) {
     core.warning(`Failed to fetch PR context: ${err}`)
     return null
   }
 }
 
-function buildDefaultSystem(prContext: string | null): string {
+function buildDefaultSystem(
+  prContext: PRContext | null,
+  tools: Record<string, any>,
+): string {
   const { owner, repo } = github.context.repo
   const event = github.context.eventName
   const pr = github.context.payload.pull_request
@@ -99,7 +155,60 @@ function buildDefaultSystem(prContext: string | null): string {
   }
 
   if (prContext) {
-    lines.push(prContext)
+    lines.push(
+      '',
+      `## Changed Files (${prContext.fileCount})`,
+      prContext.fileList,
+    )
+    if (prContext.fileListTruncated) {
+      lines.push(`  … and ${prContext.fileCount - MAX_FILE_LIST} more files`)
+    }
+
+    const incomplete = prContext.noiseFiltered.length > 0 || prContext.lengthTruncated
+
+    if (incomplete) {
+      const reasons: string[] = []
+      if (prContext.noiseFiltered.length > 0) {
+        reasons.push(`generated files were excluded from the diff: ${prContext.noiseFiltered.join(', ')}`)
+      }
+      if (prContext.lengthTruncated) reasons.push('the remaining diff was truncated to 30k characters')
+
+      lines.push(
+        '',
+        '## Diff (partial)',
+        `This diff is **incomplete**: ${reasons.join('; ')}.`,
+        'The complete file list above is authoritative. Do not assume a file is',
+        'unchanged or missing just because it does not appear in the diff below.',
+      )
+      if (prContext.noiseFiltered.length > 0) {
+        lines.push(
+          'Note: the excluded files still changed — review them if relevant to security or correctness.',
+        )
+      }
+      if ('read_file' in tools) {
+        lines.push(
+          'Use `read_file` to examine the full content of any file you need to review.',
+        )
+      } else if ('git_diff' in tools) {
+        lines.push(
+          'Use `git_diff` to examine changes in specific files you need to review.',
+        )
+      }
+      lines.push(
+        '',
+        '```diff',
+        prContext.diffPreview,
+        '```',
+      )
+    } else {
+      lines.push(
+        '',
+        '## Diff',
+        '```diff',
+        prContext.diffPreview,
+        '```',
+      )
+    }
   }
 
   return lines.join('\n')
@@ -119,7 +228,7 @@ export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<AgentLoopResult> {
   const prContext = await fetchPRContext(options.githubToken)
-  const system = options.system || buildDefaultSystem(prContext)
+  const system = options.system || buildDefaultSystem(prContext, options.tools)
 
   if (options.schema) {
     const parsed = parseSchema(options.schema)
