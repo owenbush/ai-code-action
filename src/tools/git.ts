@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import fs from 'node:fs/promises'
+import { readFile as readFileFs } from 'node:fs/promises'
 import { safePath, workspace } from './workspace.js'
 
 const execFileAsync = promisify(execFile)
@@ -17,11 +18,11 @@ async function git(
   })
 }
 
-function isForkPR(): boolean {
+export async function isForkPR(): Promise<boolean> {
   const eventPath = process.env.GITHUB_EVENT_PATH
   if (!eventPath) return false
   try {
-    const raw = require('node:fs').readFileSync(eventPath, 'utf-8')
+    const raw = await readFileFs(eventPath, 'utf-8')
     const event = JSON.parse(raw)
     const head = event.pull_request?.head?.repo?.full_name
     const base = event.pull_request?.base?.repo?.full_name
@@ -98,7 +99,7 @@ export const gitCommitAndPush = tool({
       'commit', '-m', message,
     )
 
-    if (isForkPR()) {
+    if (await isForkPR()) {
       return 'Committed locally but cannot push — this is a fork PR and origin points to the base repo, not the fork.'
     }
 

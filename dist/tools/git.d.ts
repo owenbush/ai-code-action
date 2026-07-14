@@ -1,3 +1,4 @@
+export declare function isForkPR(): Promise<boolean>;
 export declare const gitDiff: ({
     title?: string;
     providerOptions?: import("@ai-sdk/provider-utils").ProviderOptions;

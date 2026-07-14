@@ -129,7 +129,7 @@ async function fetchPRContext(githubToken: string): Promise<PRContext | null> {
 
 function buildDefaultSystem(
   prContext: PRContext | null,
-  hasLocalTools: boolean,
+  tools: Record<string, any>,
 ): string {
   const { owner, repo } = github.context.repo
   const event = github.context.eventName
@@ -185,9 +185,13 @@ function buildDefaultSystem(
           'Note: the excluded files still changed — review them if relevant to security or correctness.',
         )
       }
-      if (hasLocalTools) {
+      if ('read_file' in tools) {
         lines.push(
           'Use `read_file` to examine the full content of any file you need to review.',
+        )
+      } else if ('git_diff' in tools) {
+        lines.push(
+          'Use `git_diff` to examine changes in specific files you need to review.',
         )
       }
       lines.push(
@@ -224,8 +228,7 @@ export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<AgentLoopResult> {
   const prContext = await fetchPRContext(options.githubToken)
-  const hasLocalTools = 'read_file' in options.tools || 'list_directory' in options.tools
-  const system = options.system || buildDefaultSystem(prContext, hasLocalTools)
+  const system = options.system || buildDefaultSystem(prContext, options.tools)
 
   if (options.schema) {
     const parsed = parseSchema(options.schema)

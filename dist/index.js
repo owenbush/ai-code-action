@@ -31061,13 +31061,6 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:events"
 
 /***/ }),
 
-/***/ 3024:
-/***/ ((module) => {
-
-module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs");
-
-/***/ }),
-
 /***/ 7067:
 /***/ ((module) => {
 
@@ -89290,6 +89283,7 @@ const createDirectory = tool({
 
 
 
+
 const git_execFileAsync = (0,external_node_util_.promisify)(external_node_child_process_namespaceObject.execFile);
 async function git(...args) {
     return git_execFileAsync('git', args, {
@@ -89298,12 +89292,12 @@ async function git(...args) {
         maxBuffer: 1024 * 1024,
     });
 }
-function isForkPR() {
+async function isForkPR() {
     const eventPath = process.env.GITHUB_EVENT_PATH;
     if (!eventPath)
         return false;
     try {
-        const raw = (__nccwpck_require__(3024).readFileSync)(eventPath, 'utf-8');
+        const raw = await (0,promises_namespaceObject.readFile)(eventPath, 'utf-8');
         const event = JSON.parse(raw);
         const head = event.pull_request?.head?.repo?.full_name;
         const base = event.pull_request?.base?.repo?.full_name;
@@ -89363,7 +89357,7 @@ const gitCommitAndPush = tool({
             return 'Nothing to commit — no staged changes.';
         }
         await git('-c', 'user.name=ai-code-action', '-c', 'user.email=ai-code-action@users.noreply.github.com', 'commit', '-m', message);
-        if (isForkPR()) {
+        if (await isForkPR()) {
             return 'Committed locally but cannot push — this is a fork PR and origin points to the base repo, not the fork.';
         }
         let branch = (await git('rev-parse', '--abbrev-ref', 'HEAD')).stdout.trim();
@@ -106461,7 +106455,7 @@ async function fetchPRContext(githubToken) {
         return null;
     }
 }
-function buildDefaultSystem(prContext, hasLocalTools) {
+function buildDefaultSystem(prContext, tools) {
     const { owner, repo } = github_context.repo;
     const event = github_context.eventName;
     const pr = github_context.payload.pull_request;
@@ -106499,8 +106493,11 @@ function buildDefaultSystem(prContext, hasLocalTools) {
             if (prContext.noiseFiltered.length > 0) {
                 lines.push('Note: the excluded files still changed — review them if relevant to security or correctness.');
             }
-            if (hasLocalTools) {
+            if ('read_file' in tools) {
                 lines.push('Use `read_file` to examine the full content of any file you need to review.');
+            }
+            else if ('git_diff' in tools) {
+                lines.push('Use `git_diff` to examine changes in specific files you need to review.');
             }
             lines.push('', '```diff', prContext.diffPreview, '```');
         }
@@ -106520,8 +106517,7 @@ function parseSchema(raw) {
 }
 async function runAgentLoop(options) {
     const prContext = await fetchPRContext(options.githubToken);
-    const hasLocalTools = 'read_file' in options.tools || 'list_directory' in options.tools;
-    const system = options.system || buildDefaultSystem(prContext, hasLocalTools);
+    const system = options.system || buildDefaultSystem(prContext, options.tools);
     if (options.schema) {
         const parsed = parseSchema(options.schema);
         const result = await generateText({
