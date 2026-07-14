@@ -61,7 +61,14 @@ function filterDiff(raw: string, maxLength: number): string {
   return filtered.join('')
 }
 
-async function fetchPRContext(githubToken: string): Promise<string | null> {
+interface PRContext {
+  fileList: string
+  fileCount: number
+  diffPreview: string
+  truncated: boolean
+}
+
+async function fetchPRContext(githubToken: string): Promise<PRContext | null> {
   const pr = github.context.payload.pull_request
   if (!pr) return null
 
@@ -83,28 +90,25 @@ async function fetchPRContext(githubToken: string): Promise<string | null> {
       mediaType: { format: 'diff' },
     })
 
-    const changedFiles = allFiles
+    const fileList = allFiles
       .map((f) => `  ${f.status.charAt(0).toUpperCase()} ${f.filename} (+${f.additions} -${f.deletions})`)
       .join('\n')
 
-    const diff = filterDiff(String(diffRes.data), 30_000)
+    const rawDiff = String(diffRes.data)
+    const diffPreview = filterDiff(rawDiff, 30_000)
+    const truncated = diffPreview.length < rawDiff.length
 
-    return [
-      `\n## Changed Files (${allFiles.length})`,
-      changedFiles,
-      '',
-      '## Diff (filtered, truncated to 30k chars)',
-      '```diff',
-      diff,
-      '```',
-    ].join('\n')
+    return { fileList, fileCount: allFiles.length, diffPreview, truncated }
   } catch (err) {
     core.warning(`Failed to fetch PR context: ${err}`)
     return null
   }
 }
 
-function buildDefaultSystem(prContext: string | null): string {
+function buildDefaultSystem(
+  prContext: PRContext | null,
+  hasLocalTools: boolean,
+): string {
   const { owner, repo } = github.context.repo
   const event = github.context.eventName
   const pr = github.context.payload.pull_request
@@ -129,7 +133,34 @@ function buildDefaultSystem(prContext: string | null): string {
   }
 
   if (prContext) {
-    lines.push(prContext)
+    lines.push(
+      '',
+      `## Changed Files (${prContext.fileCount})`,
+      prContext.fileList,
+    )
+
+    if (prContext.truncated && hasLocalTools) {
+      lines.push(
+        '',
+        '## Diff Preview',
+        'The diff below is a **preview** — it may not include all changed files.',
+        'The complete file list above is authoritative. Use `read_file` to examine',
+        'the full content of any file you need to review. Do not assume a file is',
+        'unchanged or missing just because it does not appear in the diff preview.',
+        '',
+        '```diff',
+        prContext.diffPreview,
+        '```',
+      )
+    } else {
+      lines.push(
+        '',
+        '## Diff',
+        '```diff',
+        prContext.diffPreview,
+        '```',
+      )
+    }
   }
 
   return lines.join('\n')
@@ -149,7 +180,8 @@ export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<AgentLoopResult> {
   const prContext = await fetchPRContext(options.githubToken)
-  const system = options.system || buildDefaultSystem(prContext)
+  const hasLocalTools = 'read_file' in options.tools
+  const system = options.system || buildDefaultSystem(prContext, hasLocalTools)
 
   if (options.schema) {
     const parsed = parseSchema(options.schema)

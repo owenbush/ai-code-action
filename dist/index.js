@@ -106381,26 +106381,20 @@ async function fetchPRContext(githubToken) {
             pull_number: pr.number,
             mediaType: { format: 'diff' },
         });
-        const changedFiles = allFiles
+        const fileList = allFiles
             .map((f) => `  ${f.status.charAt(0).toUpperCase()} ${f.filename} (+${f.additions} -${f.deletions})`)
             .join('\n');
-        const diff = filterDiff(String(diffRes.data), 30_000);
-        return [
-            `\n## Changed Files (${allFiles.length})`,
-            changedFiles,
-            '',
-            '## Diff (filtered, truncated to 30k chars)',
-            '```diff',
-            diff,
-            '```',
-        ].join('\n');
+        const rawDiff = String(diffRes.data);
+        const diffPreview = filterDiff(rawDiff, 30_000);
+        const truncated = diffPreview.length < rawDiff.length;
+        return { fileList, fileCount: allFiles.length, diffPreview, truncated };
     }
     catch (err) {
         warning(`Failed to fetch PR context: ${err}`);
         return null;
     }
 }
-function buildDefaultSystem(prContext) {
+function buildDefaultSystem(prContext, hasLocalTools) {
     const { owner, repo } = github_context.repo;
     const event = github_context.eventName;
     const pr = github_context.payload.pull_request;
@@ -106422,7 +106416,13 @@ function buildDefaultSystem(prContext) {
         }
     }
     if (prContext) {
-        lines.push(prContext);
+        lines.push('', `## Changed Files (${prContext.fileCount})`, prContext.fileList);
+        if (prContext.truncated && hasLocalTools) {
+            lines.push('', '## Diff Preview', 'The diff below is a **preview** — it may not include all changed files.', 'The complete file list above is authoritative. Use `read_file` to examine', 'the full content of any file you need to review. Do not assume a file is', 'unchanged or missing just because it does not appear in the diff preview.', '', '```diff', prContext.diffPreview, '```');
+        }
+        else {
+            lines.push('', '## Diff', '```diff', prContext.diffPreview, '```');
+        }
     }
     return lines.join('\n');
 }
@@ -106436,7 +106436,8 @@ function parseSchema(raw) {
 }
 async function runAgentLoop(options) {
     const prContext = await fetchPRContext(options.githubToken);
-    const system = options.system || buildDefaultSystem(prContext);
+    const hasLocalTools = 'read_file' in options.tools;
+    const system = options.system || buildDefaultSystem(prContext, hasLocalTools);
     if (options.schema) {
         const parsed = parseSchema(options.schema);
         const result = await generateText({
