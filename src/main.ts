@@ -42,6 +42,7 @@ async function run(): Promise<void> {
   const schema = core.getInput('schema') || undefined
   const githubToken = core.getInput('github-token')
   const allowGithubWrites = getBooleanInputSafe('allow-github-writes')
+  const allowWriteOnPr = getBooleanInputSafe('allow-write-on-pr')
   const allowShellOnPr = getBooleanInputSafe('allow-shell-on-pr')
 
   const isPREvent = !!github.context.payload.pull_request
@@ -49,6 +50,17 @@ async function run(): Promise<void> {
   if (!githubToken && (comment || isPREvent)) {
     throw new Error(
       'github-token is required when comment is enabled or running on a pull_request event',
+    )
+  }
+
+  const hasWriteFlags =
+    toolFlags.includes('local-write') || toolFlags.includes('git')
+  if (hasWriteFlags && isPREvent && !allowWriteOnPr) {
+    throw new Error(
+      'Write and git tools are disabled on pull_request events by default because PR content ' +
+        '(title, body, diff) is attacker-controlled on public repos and is injected into ' +
+        'the system prompt. A malicious PR could instruct the model to overwrite files or push ' +
+        'commits. Set allow-write-on-pr: true to override if you understand the risk.',
     )
   }
 

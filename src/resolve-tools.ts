@@ -92,6 +92,13 @@ export function resolveTools(
   }
 
   if (toolFlags.includes('git')) {
+    if (!allowGithubWrites) {
+      core.warning(
+        'tools: git is enabled but allow-github-writes is false. The git tools can push ' +
+          'commits directly, bypassing the GitHub API write guard. If you intended to block ' +
+          'all repo mutation, remove "git" from the tools list.',
+      )
+    }
     tools = { ...tools, ...GIT_TOOLS }
   }
 

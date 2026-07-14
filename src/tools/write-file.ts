@@ -15,7 +15,7 @@ export const writeFile = tool({
     const resolved = safePath(filePath)
     await fs.mkdir(path.dirname(resolved), { recursive: true })
     await fs.writeFile(resolved, content, 'utf-8')
-    return `Wrote ${content.length} bytes to ${filePath}`
+    return `Wrote ${Buffer.byteLength(content, 'utf-8')} bytes to ${filePath}`
   },
 })
 

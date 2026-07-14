@@ -140,9 +140,11 @@ For non-PR events (e.g. `workflow_dispatch`, `schedule`), shell is allowed but y
 
 ### Write and git tools
 
-The `local-write` and `git` tool flags let the model modify files and push commits. All file operations are sandboxed to the workspace directory — paths that escape the checkout are rejected. The `git_commit_and_push` tool stages only the files the model specifies, never `git add -A`.
+The `local-write` and `git` tool flags let the model modify files and push commits. All file operations are sandboxed to the workspace directory — paths that escape the checkout are rejected. The `git_commit_and_push` tool uses `git add -- <files>` to stage only the paths the model specifies — flags like `-A` or `--all` are treated as pathspecs, not options.
 
-These flags are safe on non-PR events (e.g. `workflow_dispatch`, `schedule`) where the prompt is trusted. **Avoid enabling them on `pull_request` events** for public repos — a malicious diff could instruct the model to overwrite files or push unwanted commits.
+**On `pull_request` events, write and git tools are disabled by default** — the same guard as shell, for the same reason: PR content is attacker-controlled on public repos, and `git_commit_and_push` persists changes to the remote. Set `allow-write-on-pr: true` only if you understand this risk (e.g. private repo, restricted runner).
+
+Note: `allow-github-writes` controls GitHub API write tools (comments, issues, labels). The `git` tool flag is a separate write path that pushes commits directly via git. If you set `allow-github-writes: false` but enable `tools: git`, the model can still mutate the repo through commits. The action logs a warning when this happens.
 
 ### GitHub write tools
 
@@ -309,6 +311,7 @@ jobs:
 | `schema` | | — | JSON Schema for structured output |
 | `github-token` | | `${{ github.token }}` | GitHub token |
 | `allow-github-writes` | | `false` | Allow model-initiated GitHub API writes |
+| `allow-write-on-pr` | | `false` | Allow local-write and git tools on pull_request events |
 | `allow-shell-on-pr` | | `false` | Allow shell tool on pull_request events |
 
 ## Outputs

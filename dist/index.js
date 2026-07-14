@@ -88306,7 +88306,7 @@ const write_file_writeFile = tool({
         const resolved = safePath(filePath);
         await promises_default().mkdir(external_node_path_default().dirname(resolved), { recursive: true });
         await promises_default().writeFile(resolved, content, 'utf-8');
-        return `Wrote ${content.length} bytes to ${filePath}`;
+        return `Wrote ${Buffer.byteLength(content, 'utf-8')} bytes to ${filePath}`;
     },
 });
 const createDirectory = tool({
@@ -88350,6 +88350,9 @@ const gitDiff = tool({
             .describe('Restrict diff to a specific file or directory'),
     }),
     execute: async ({ ref, nameOnly, path: diffPath }) => {
+        if (ref && ref.startsWith('-')) {
+            return 'Invalid ref: must not start with "-"';
+        }
         const args = ['diff'];
         if (nameOnly)
             args.push('--name-only');
@@ -88370,12 +88373,12 @@ const gitCommitAndPush = tool({
         message: schemas_string().describe('Commit message'),
     }),
     execute: async ({ files, message }) => {
-        await git('add', ...files);
+        await git('add', '--', ...files);
         const { stdout: status } = await git('status', '--porcelain');
         if (!status.trim()) {
             return 'Nothing to commit — no staged changes.';
         }
-        await git('commit', '-m', message);
+        await git('-c', 'user.name=ai-code-action', '-c', 'user.email=ai-code-action@users.noreply.github.com', 'commit', '-m', message);
         const { stdout: branch } = await git('rev-parse', '--abbrev-ref', 'HEAD');
         await git('push', 'origin', branch.trim());
         return `Committed and pushed to ${branch.trim()}: ${message}`;
@@ -88490,6 +88493,11 @@ function resolveTools(token, preset, toolFlags, allowGithubWrites) {
         tools = { ...tools, ...LOCAL_WRITE_TOOLS };
     }
     if (toolFlags.includes('git')) {
+        if (!allowGithubWrites) {
+            warning('tools: git is enabled but allow-github-writes is false. The git tools can push ' +
+                'commits directly, bypassing the GitHub API write guard. If you intended to block ' +
+                'all repo mutation, remove "git" from the tools list.');
+        }
         tools = { ...tools, ...GIT_TOOLS };
     }
     if (toolFlags.includes('shell')) {
@@ -105574,10 +105582,18 @@ async function run() {
     const schema = getInput('schema') || undefined;
     const githubToken = getInput('github-token');
     const allowGithubWrites = getBooleanInputSafe('allow-github-writes');
+    const allowWriteOnPr = getBooleanInputSafe('allow-write-on-pr');
     const allowShellOnPr = getBooleanInputSafe('allow-shell-on-pr');
     const isPREvent = !!github_context.payload.pull_request;
     if (!githubToken && (comment || isPREvent)) {
         throw new Error('github-token is required when comment is enabled or running on a pull_request event');
+    }
+    const hasWriteFlags = toolFlags.includes('local-write') || toolFlags.includes('git');
+    if (hasWriteFlags && isPREvent && !allowWriteOnPr) {
+        throw new Error('Write and git tools are disabled on pull_request events by default because PR content ' +
+            '(title, body, diff) is attacker-controlled on public repos and is injected into ' +
+            'the system prompt. A malicious PR could instruct the model to overwrite files or push ' +
+            'commits. Set allow-write-on-pr: true to override if you understand the risk.');
     }
     if (toolFlags.includes('shell') && isPREvent && !allowShellOnPr) {
         throw new Error('Shell tool is disabled on pull_request events by default because PR content ' +

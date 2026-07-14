@@ -36,6 +36,9 @@ export const gitDiff = tool({
       .describe('Restrict diff to a specific file or directory'),
   }),
   execute: async ({ ref, nameOnly, path: diffPath }) => {
+    if (ref && ref.startsWith('-')) {
+      return 'Invalid ref: must not start with "-"'
+    }
     const args = ['diff']
     if (nameOnly) args.push('--name-only')
     if (ref) args.push(ref)
@@ -60,14 +63,18 @@ export const gitCommitAndPush = tool({
     message: z.string().describe('Commit message'),
   }),
   execute: async ({ files, message }) => {
-    await git('add', ...files)
+    await git('add', '--', ...files)
 
     const { stdout: status } = await git('status', '--porcelain')
     if (!status.trim()) {
       return 'Nothing to commit — no staged changes.'
     }
 
-    await git('commit', '-m', message)
+    await git(
+      '-c', 'user.name=ai-code-action',
+      '-c', 'user.email=ai-code-action@users.noreply.github.com',
+      'commit', '-m', message,
+    )
 
     const { stdout: branch } = await git(
       'rev-parse',
