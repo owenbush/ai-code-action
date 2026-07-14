@@ -76,13 +76,17 @@ export const gitCommitAndPush = tool({
       'commit', '-m', message,
     )
 
-    const { stdout: branch } = await git(
-      'rev-parse',
-      '--abbrev-ref',
-      'HEAD',
-    )
-    await git('push', 'origin', branch.trim())
+    let branch = (
+      await git('rev-parse', '--abbrev-ref', 'HEAD')
+    ).stdout.trim()
+    if (branch === 'HEAD') {
+      branch = process.env.GITHUB_HEAD_REF || ''
+    }
+    if (!branch) {
+      return 'Committed locally but cannot push — detached HEAD and GITHUB_HEAD_REF is not set. Check out a branch first.'
+    }
+    await git('push', 'origin', `HEAD:refs/heads/${branch}`)
 
-    return `Committed and pushed to ${branch.trim()}: ${message}`
+    return `Committed and pushed to ${branch}: ${message}`
   },
 })

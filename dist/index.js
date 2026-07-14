@@ -88379,9 +88379,15 @@ const gitCommitAndPush = tool({
             return 'Nothing to commit — no staged changes.';
         }
         await git('-c', 'user.name=ai-code-action', '-c', 'user.email=ai-code-action@users.noreply.github.com', 'commit', '-m', message);
-        const { stdout: branch } = await git('rev-parse', '--abbrev-ref', 'HEAD');
-        await git('push', 'origin', branch.trim());
-        return `Committed and pushed to ${branch.trim()}: ${message}`;
+        let branch = (await git('rev-parse', '--abbrev-ref', 'HEAD')).stdout.trim();
+        if (branch === 'HEAD') {
+            branch = process.env.GITHUB_HEAD_REF || '';
+        }
+        if (!branch) {
+            return 'Committed locally but cannot push — detached HEAD and GITHUB_HEAD_REF is not set. Check out a branch first.';
+        }
+        await git('push', 'origin', `HEAD:refs/heads/${branch}`);
+        return `Committed and pushed to ${branch}: ${message}`;
     },
 });
 
