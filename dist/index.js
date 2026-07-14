@@ -31061,6 +31061,13 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:events"
 
 /***/ }),
 
+/***/ 3024:
+/***/ ((module) => {
+
+module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs");
+
+/***/ }),
+
 /***/ 7067:
 /***/ ((module) => {
 
@@ -89097,11 +89104,32 @@ const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(impo
 var external_node_path_default = /*#__PURE__*/__nccwpck_require__.n(external_node_path_namespaceObject);
 ;// CONCATENATED MODULE: ./src/tools/workspace.ts
 
+
 const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
-function safePath(relative) {
+function safePathLexical(relative) {
     const resolved = external_node_path_default().resolve(workspace, relative);
     if (resolved !== workspace && !resolved.startsWith(workspace + (external_node_path_default()).sep)) {
         throw new Error(`Path "${relative}" escapes the workspace`);
+    }
+    return resolved;
+}
+async function safePath(relative) {
+    const resolved = safePathLexical(relative);
+    const realWorkspace = await promises_default().realpath(workspace);
+    let existing = resolved;
+    while (existing !== external_node_path_default().dirname(existing)) {
+        try {
+            await promises_default().lstat(existing);
+            break;
+        }
+        catch {
+            existing = external_node_path_default().dirname(existing);
+        }
+    }
+    const realExisting = await promises_default().realpath(existing);
+    if (realExisting !== realWorkspace &&
+        !realExisting.startsWith(realWorkspace + (external_node_path_default()).sep)) {
+        throw new Error(`Path "${relative}" escapes the workspace via symlink`);
     }
     return resolved;
 }
@@ -89118,7 +89146,7 @@ const readFile = tool({
         path: schemas_string().describe('Relative path to the file from the repo root'),
     }),
     execute: async ({ path: filePath }) => {
-        const resolved = safePath(filePath);
+        const resolved = await safePath(filePath);
         const content = await promises_default().readFile(resolved, 'utf-8');
         return content;
     },
@@ -89166,7 +89194,7 @@ const listDirectory = tool({
             .describe('Maximum directory depth to recurse (1-5)'),
     }),
     execute: async ({ path: dirPath, depth }) => {
-        const resolved = safePath(dirPath);
+        const resolved = await safePath(dirPath);
         const files = await listRecursive(resolved, depth);
         return files.join('\n');
     },
@@ -89237,7 +89265,7 @@ const write_file_writeFile = tool({
         content: schemas_string().describe('The full content to write to the file'),
     }),
     execute: async ({ path: filePath, content }) => {
-        const resolved = safePath(filePath);
+        const resolved = await safePath(filePath);
         await promises_default().mkdir(external_node_path_default().dirname(resolved), { recursive: true });
         await promises_default().writeFile(resolved, content, 'utf-8');
         return `Wrote ${Buffer.byteLength(content, 'utf-8')} bytes to ${filePath}`;
@@ -89250,7 +89278,7 @@ const createDirectory = tool({
             .describe('Relative directory path from the repo root'),
     }),
     execute: async ({ path: dirPath }) => {
-        const resolved = safePath(dirPath);
+        const resolved = await safePath(dirPath);
         await promises_default().mkdir(resolved, { recursive: true });
         return `Created directory ${dirPath}`;
     },
@@ -89270,6 +89298,21 @@ async function git(...args) {
         maxBuffer: 1024 * 1024,
     });
 }
+function isForkPR() {
+    const eventPath = process.env.GITHUB_EVENT_PATH;
+    if (!eventPath)
+        return false;
+    try {
+        const raw = (__nccwpck_require__(3024).readFileSync)(eventPath, 'utf-8');
+        const event = JSON.parse(raw);
+        const head = event.pull_request?.head?.repo?.full_name;
+        const base = event.pull_request?.base?.repo?.full_name;
+        return !!(head && base && head !== base);
+    }
+    catch {
+        return false;
+    }
+}
 const gitDiff = tool({
     description: 'Show the git diff for the current working tree or between refs. Useful for seeing what files have changed and what the changes are.',
     inputSchema: object({
@@ -89286,6 +89329,9 @@ const gitDiff = tool({
     execute: async ({ ref, nameOnly, path: diffPath }) => {
         if (ref && ref.startsWith('-')) {
             return 'Invalid ref: must not start with "-"';
+        }
+        if (diffPath) {
+            await safePath(diffPath);
         }
         const args = ['diff'];
         if (nameOnly)
@@ -89307,12 +89353,19 @@ const gitCommitAndPush = tool({
         message: schemas_string().describe('Commit message'),
     }),
     execute: async ({ files, message }) => {
+        for (const f of files) {
+            if (f !== '.')
+                await safePath(f);
+        }
         await git('add', '--', ...files);
-        const { stdout: status } = await git('status', '--porcelain');
-        if (!status.trim()) {
+        const { stdout: staged } = await git('diff', '--cached', '--name-only');
+        if (!staged.trim()) {
             return 'Nothing to commit — no staged changes.';
         }
         await git('-c', 'user.name=ai-code-action', '-c', 'user.email=ai-code-action@users.noreply.github.com', 'commit', '-m', message);
+        if (isForkPR()) {
+            return 'Committed locally but cannot push — this is a fork PR and origin points to the base repo, not the fork.';
+        }
         let branch = (await git('rev-parse', '--abbrev-ref', 'HEAD')).stdout.trim();
         if (branch === 'HEAD') {
             branch = process.env.GITHUB_HEAD_REF || '';
@@ -89388,13 +89441,13 @@ const LOCAL_READ_TOOLS = {
     read_file: readFile,
     list_directory: listDirectory,
     search_files: searchFiles,
+    git_diff: gitDiff,
 };
 const LOCAL_WRITE_TOOLS = {
     write_file: write_file_writeFile,
     create_directory: createDirectory,
 };
-const GIT_TOOLS = {
-    git_diff: gitDiff,
+const GIT_WRITE_TOOLS = {
     git_commit_and_push: gitCommitAndPush,
 };
 const SHELL_TOOLS = {
@@ -89438,7 +89491,10 @@ function resolveTools(token, preset, toolFlags, allowGithubWrites) {
                 'commits directly, bypassing the GitHub API write guard. If you intended to block ' +
                 'all repo mutation, remove "git" from the tools list.');
         }
-        tools = { ...tools, ...GIT_TOOLS };
+        tools = { ...tools, ...GIT_WRITE_TOOLS };
+        if (!toolFlags.includes('local-files')) {
+            tools.git_diff = gitDiff;
+        }
     }
     if (toolFlags.includes('shell')) {
         tools = { ...tools, ...SHELL_TOOLS };
@@ -106338,16 +106394,20 @@ const DIFF_NOISE_PATTERNS = [
 function isNoiseFile(diffHeader) {
     return DIFF_NOISE_PATTERNS.some((p) => p.test(diffHeader));
 }
+function extractFileName(diffHeader) {
+    const match = diffHeader.match(/^diff --git a\/(.+?) b\//);
+    return match ? match[1] : diffHeader;
+}
 function filterDiff(raw, maxLength) {
     const files = raw.split(/(?=^diff --git )/m);
     const filtered = [];
+    const noiseFiltered = [];
     let length = 0;
-    let noiseFiltered = false;
     let lengthTruncated = false;
     for (const file of files) {
         const firstLine = file.slice(0, file.indexOf('\n'));
         if (isNoiseFile(firstLine)) {
-            noiseFiltered = true;
+            noiseFiltered.push(extractFileName(firstLine));
             continue;
         }
         if (length + file.length > maxLength) {
@@ -106367,6 +106427,7 @@ function filterDiff(raw, maxLength) {
     }
     return { text: filtered.join(''), noiseFiltered, lengthTruncated };
 }
+const MAX_FILE_LIST = 300;
 async function fetchPRContext(githubToken) {
     const pr = github_context.payload.pull_request;
     if (!pr)
@@ -106386,12 +106447,14 @@ async function fetchPRContext(githubToken) {
             pull_number: pr.number,
             mediaType: { format: 'diff' },
         });
-        const fileList = allFiles
+        const displayed = allFiles.slice(0, MAX_FILE_LIST);
+        const fileListTruncated = allFiles.length > MAX_FILE_LIST;
+        const fileList = displayed
             .map((f) => `  ${f.status.charAt(0).toUpperCase()} ${f.filename} (+${f.additions} -${f.deletions})`)
             .join('\n');
         const rawDiff = String(diffRes.data);
         const { text: diffPreview, noiseFiltered, lengthTruncated } = filterDiff(rawDiff, 30_000);
-        return { fileList, fileCount: allFiles.length, diffPreview, noiseFiltered, lengthTruncated };
+        return { fileList, fileCount: allFiles.length, fileListTruncated, diffPreview, noiseFiltered, lengthTruncated };
     }
     catch (err) {
         warning(`Failed to fetch PR context: ${err}`);
@@ -106421,14 +106484,21 @@ function buildDefaultSystem(prContext, hasLocalTools) {
     }
     if (prContext) {
         lines.push('', `## Changed Files (${prContext.fileCount})`, prContext.fileList);
-        const incomplete = prContext.noiseFiltered || prContext.lengthTruncated;
+        if (prContext.fileListTruncated) {
+            lines.push(`  … and ${prContext.fileCount - MAX_FILE_LIST} more files`);
+        }
+        const incomplete = prContext.noiseFiltered.length > 0 || prContext.lengthTruncated;
         if (incomplete) {
             const reasons = [];
-            if (prContext.noiseFiltered)
-                reasons.push('generated files (dist/, .map, .d.ts, lock files) were excluded');
+            if (prContext.noiseFiltered.length > 0) {
+                reasons.push(`generated files were excluded from the diff: ${prContext.noiseFiltered.join(', ')}`);
+            }
             if (prContext.lengthTruncated)
                 reasons.push('the remaining diff was truncated to 30k characters');
-            lines.push('', '## Diff (partial)', `This diff is **incomplete**: ${reasons.join(' and ')}.`, 'The complete file list above is authoritative. Do not assume a file is', 'unchanged or missing just because it does not appear in the diff below.');
+            lines.push('', '## Diff (partial)', `This diff is **incomplete**: ${reasons.join('; ')}.`, 'The complete file list above is authoritative. Do not assume a file is', 'unchanged or missing just because it does not appear in the diff below.');
+            if (prContext.noiseFiltered.length > 0) {
+                lines.push('Note: the excluded files still changed — review them if relevant to security or correctness.');
+            }
             if (hasLocalTools) {
                 lines.push('Use `read_file` to examine the full content of any file you need to review.');
             }
@@ -106450,7 +106520,7 @@ function parseSchema(raw) {
 }
 async function runAgentLoop(options) {
     const prContext = await fetchPRContext(options.githubToken);
-    const hasLocalTools = 'read_file' in options.tools;
+    const hasLocalTools = 'read_file' in options.tools || 'list_directory' in options.tools;
     const system = options.system || buildDefaultSystem(prContext, hasLocalTools);
     if (options.schema) {
         const parsed = parseSchema(options.schema);
@@ -106582,7 +106652,8 @@ async function run() {
     const allowGithubWrites = getBooleanInputSafe('allow-github-writes');
     const allowWriteOnPr = getBooleanInputSafe('allow-write-on-pr');
     const allowShellOnPr = getBooleanInputSafe('allow-shell-on-pr');
-    const isPREvent = !!github_context.payload.pull_request;
+    const isPREvent = !!github_context.payload.pull_request ||
+        !!github_context.payload.issue?.pull_request;
     if (!githubToken && (comment || isPREvent)) {
         throw new Error('github-token is required when comment is enabled or running on a pull_request event');
     }

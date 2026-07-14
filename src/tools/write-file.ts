@@ -12,7 +12,7 @@ export const writeFile = tool({
     content: z.string().describe('The full content to write to the file'),
   }),
   execute: async ({ path: filePath, content }) => {
-    const resolved = safePath(filePath)
+    const resolved = await safePath(filePath)
     await fs.mkdir(path.dirname(resolved), { recursive: true })
     await fs.writeFile(resolved, content, 'utf-8')
     return `Wrote ${Buffer.byteLength(content, 'utf-8')} bytes to ${filePath}`
@@ -28,7 +28,7 @@ export const createDirectory = tool({
       .describe('Relative directory path from the repo root'),
   }),
   execute: async ({ path: dirPath }) => {
-    const resolved = safePath(dirPath)
+    const resolved = await safePath(dirPath)
     await fs.mkdir(resolved, { recursive: true })
     return `Created directory ${dirPath}`
   },

@@ -29,6 +29,7 @@ const LOCAL_READ_TOOLS = {
   read_file: readFile,
   list_directory: listDirectory,
   search_files: searchFiles,
+  git_diff: gitDiff,
 } as const
 
 const LOCAL_WRITE_TOOLS = {
@@ -36,8 +37,7 @@ const LOCAL_WRITE_TOOLS = {
   create_directory: createDirectory,
 } as const
 
-const GIT_TOOLS = {
-  git_diff: gitDiff,
+const GIT_WRITE_TOOLS = {
   git_commit_and_push: gitCommitAndPush,
 } as const
 
@@ -99,7 +99,10 @@ export function resolveTools(
           'all repo mutation, remove "git" from the tools list.',
       )
     }
-    tools = { ...tools, ...GIT_TOOLS }
+    tools = { ...tools, ...GIT_WRITE_TOOLS }
+    if (!toolFlags.includes('local-files')) {
+      tools.git_diff = gitDiff
+    }
   }
 
   if (toolFlags.includes('shell')) {

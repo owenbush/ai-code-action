@@ -45,7 +45,9 @@ async function run(): Promise<void> {
   const allowWriteOnPr = getBooleanInputSafe('allow-write-on-pr')
   const allowShellOnPr = getBooleanInputSafe('allow-shell-on-pr')
 
-  const isPREvent = !!github.context.payload.pull_request
+  const isPREvent =
+    !!github.context.payload.pull_request ||
+    !!github.context.payload.issue?.pull_request
 
   if (!githubToken && (comment || isPREvent)) {
     throw new Error(

@@ -55,6 +55,7 @@ describe('resolveTools', () => {
     expect(tools).toHaveProperty('read_file')
     expect(tools).toHaveProperty('list_directory')
     expect(tools).toHaveProperty('search_files')
+    expect(tools).toHaveProperty('git_diff')
   })
 
   it('does not add local-files tools when flag is absent', () => {
@@ -76,10 +77,17 @@ describe('resolveTools', () => {
     expect(tools).not.toHaveProperty('create_directory')
   })
 
-  it('adds git tools when flag is set', () => {
+  it('adds git_commit_and_push and git_diff fallback when git flag is set without local-files', () => {
     const tools = resolveTools(TOKEN, 'code-review', ['git'], false)
-    expect(tools).toHaveProperty('git_diff')
     expect(tools).toHaveProperty('git_commit_and_push')
+    expect(tools).toHaveProperty('git_diff')
+  })
+
+  it('does not duplicate git_diff when both local-files and git flags are set', () => {
+    const tools = resolveTools(TOKEN, 'code-review', ['local-files', 'git'], false)
+    expect(tools).toHaveProperty('git_commit_and_push')
+    expect(tools).toHaveProperty('git_diff')
+    expect(tools).toHaveProperty('read_file')
   })
 
   it('does not add git tools when flag is absent', () => {

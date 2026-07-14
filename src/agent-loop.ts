@@ -38,21 +38,26 @@ function isNoiseFile(diffHeader: string): boolean {
 
 interface FilterResult {
   text: string
-  noiseFiltered: boolean
+  noiseFiltered: string[]
   lengthTruncated: boolean
+}
+
+function extractFileName(diffHeader: string): string {
+  const match = diffHeader.match(/^diff --git a\/(.+?) b\//)
+  return match ? match[1] : diffHeader
 }
 
 function filterDiff(raw: string, maxLength: number): FilterResult {
   const files = raw.split(/(?=^diff --git )/m)
   const filtered: string[] = []
+  const noiseFiltered: string[] = []
   let length = 0
-  let noiseFiltered = false
   let lengthTruncated = false
 
   for (const file of files) {
     const firstLine = file.slice(0, file.indexOf('\n'))
     if (isNoiseFile(firstLine)) {
-      noiseFiltered = true
+      noiseFiltered.push(extractFileName(firstLine))
       continue
     }
     if (length + file.length > maxLength) {
@@ -73,11 +78,14 @@ function filterDiff(raw: string, maxLength: number): FilterResult {
   return { text: filtered.join(''), noiseFiltered, lengthTruncated }
 }
 
+const MAX_FILE_LIST = 300
+
 interface PRContext {
   fileList: string
   fileCount: number
+  fileListTruncated: boolean
   diffPreview: string
-  noiseFiltered: boolean
+  noiseFiltered: string[]
   lengthTruncated: boolean
 }
 
@@ -103,14 +111,16 @@ async function fetchPRContext(githubToken: string): Promise<PRContext | null> {
       mediaType: { format: 'diff' },
     })
 
-    const fileList = allFiles
+    const displayed = allFiles.slice(0, MAX_FILE_LIST)
+    const fileListTruncated = allFiles.length > MAX_FILE_LIST
+    const fileList = displayed
       .map((f) => `  ${f.status.charAt(0).toUpperCase()} ${f.filename} (+${f.additions} -${f.deletions})`)
       .join('\n')
 
     const rawDiff = String(diffRes.data)
     const { text: diffPreview, noiseFiltered, lengthTruncated } = filterDiff(rawDiff, 30_000)
 
-    return { fileList, fileCount: allFiles.length, diffPreview, noiseFiltered, lengthTruncated }
+    return { fileList, fileCount: allFiles.length, fileListTruncated, diffPreview, noiseFiltered, lengthTruncated }
   } catch (err) {
     core.warning(`Failed to fetch PR context: ${err}`)
     return null
@@ -150,21 +160,31 @@ function buildDefaultSystem(
       `## Changed Files (${prContext.fileCount})`,
       prContext.fileList,
     )
+    if (prContext.fileListTruncated) {
+      lines.push(`  … and ${prContext.fileCount - MAX_FILE_LIST} more files`)
+    }
 
-    const incomplete = prContext.noiseFiltered || prContext.lengthTruncated
+    const incomplete = prContext.noiseFiltered.length > 0 || prContext.lengthTruncated
 
     if (incomplete) {
       const reasons: string[] = []
-      if (prContext.noiseFiltered) reasons.push('generated files (dist/, .map, .d.ts, lock files) were excluded')
+      if (prContext.noiseFiltered.length > 0) {
+        reasons.push(`generated files were excluded from the diff: ${prContext.noiseFiltered.join(', ')}`)
+      }
       if (prContext.lengthTruncated) reasons.push('the remaining diff was truncated to 30k characters')
 
       lines.push(
         '',
         '## Diff (partial)',
-        `This diff is **incomplete**: ${reasons.join(' and ')}.`,
+        `This diff is **incomplete**: ${reasons.join('; ')}.`,
         'The complete file list above is authoritative. Do not assume a file is',
         'unchanged or missing just because it does not appear in the diff below.',
       )
+      if (prContext.noiseFiltered.length > 0) {
+        lines.push(
+          'Note: the excluded files still changed — review them if relevant to security or correctness.',
+        )
+      }
       if (hasLocalTools) {
         lines.push(
           'Use `read_file` to examine the full content of any file you need to review.',
@@ -204,7 +224,7 @@ export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<AgentLoopResult> {
   const prContext = await fetchPRContext(options.githubToken)
-  const hasLocalTools = 'read_file' in options.tools
+  const hasLocalTools = 'read_file' in options.tools || 'list_directory' in options.tools
   const system = options.system || buildDefaultSystem(prContext, hasLocalTools)
 
   if (options.schema) {

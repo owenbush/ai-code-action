@@ -2,7 +2,8 @@ import { tool } from 'ai'
 import { z } from 'zod'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { workspace } from './workspace.js'
+import fs from 'node:fs/promises'
+import { safePath, workspace } from './workspace.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -14,6 +15,20 @@ async function git(
     timeout: 30_000,
     maxBuffer: 1024 * 1024,
   })
+}
+
+function isForkPR(): boolean {
+  const eventPath = process.env.GITHUB_EVENT_PATH
+  if (!eventPath) return false
+  try {
+    const raw = require('node:fs').readFileSync(eventPath, 'utf-8')
+    const event = JSON.parse(raw)
+    const head = event.pull_request?.head?.repo?.full_name
+    const base = event.pull_request?.base?.repo?.full_name
+    return !!(head && base && head !== base)
+  } catch {
+    return false
+  }
 }
 
 export const gitDiff = tool({
@@ -39,6 +54,9 @@ export const gitDiff = tool({
     if (ref && ref.startsWith('-')) {
       return 'Invalid ref: must not start with "-"'
     }
+    if (diffPath) {
+      await safePath(diffPath)
+    }
     const args = ['diff']
     if (nameOnly) args.push('--name-only')
     if (ref) args.push(ref)
@@ -63,10 +81,14 @@ export const gitCommitAndPush = tool({
     message: z.string().describe('Commit message'),
   }),
   execute: async ({ files, message }) => {
+    for (const f of files) {
+      if (f !== '.') await safePath(f)
+    }
+
     await git('add', '--', ...files)
 
-    const { stdout: status } = await git('status', '--porcelain')
-    if (!status.trim()) {
+    const { stdout: staged } = await git('diff', '--cached', '--name-only')
+    if (!staged.trim()) {
       return 'Nothing to commit — no staged changes.'
     }
 
@@ -75,6 +97,10 @@ export const gitCommitAndPush = tool({
       '-c', 'user.email=ai-code-action@users.noreply.github.com',
       'commit', '-m', message,
     )
+
+    if (isForkPR()) {
+      return 'Committed locally but cannot push — this is a fork PR and origin points to the base repo, not the fork.'
+    }
 
     let branch = (
       await git('rev-parse', '--abbrev-ref', 'HEAD')

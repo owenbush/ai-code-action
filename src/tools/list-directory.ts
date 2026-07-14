@@ -46,7 +46,7 @@ export const listDirectory = tool({
       .describe('Maximum directory depth to recurse (1-5)'),
   }),
   execute: async ({ path: dirPath, depth }) => {
-    const resolved = safePath(dirPath)
+    const resolved = await safePath(dirPath)
     const files = await listRecursive(resolved, depth)
     return files.join('\n')
   },
