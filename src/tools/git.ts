@@ -2,7 +2,6 @@ import { tool } from 'ai'
 import { z } from 'zod'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import fs from 'node:fs/promises'
 import { readFile as readFileFs } from 'node:fs/promises'
 import { safePath, workspace } from './workspace.js'
 
