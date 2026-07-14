@@ -65,7 +65,8 @@ interface PRContext {
   fileList: string
   fileCount: number
   diffPreview: string
-  truncated: boolean
+  filtered: boolean
+  lengthTruncated: boolean
 }
 
 async function fetchPRContext(githubToken: string): Promise<PRContext | null> {
@@ -96,9 +97,10 @@ async function fetchPRContext(githubToken: string): Promise<PRContext | null> {
 
     const rawDiff = String(diffRes.data)
     const diffPreview = filterDiff(rawDiff, 30_000)
-    const truncated = diffPreview.length < rawDiff.length
+    const filtered = diffPreview.length < rawDiff.length
+    const lengthTruncated = diffPreview.length >= 30_000
 
-    return { fileList, fileCount: allFiles.length, diffPreview, truncated }
+    return { fileList, fileCount: allFiles.length, diffPreview, filtered, lengthTruncated }
   } catch (err) {
     core.warning(`Failed to fetch PR context: ${err}`)
     return null
@@ -139,14 +141,26 @@ function buildDefaultSystem(
       prContext.fileList,
     )
 
-    if (prContext.truncated && hasLocalTools) {
+    const incomplete = prContext.filtered || prContext.lengthTruncated
+
+    if (incomplete) {
+      const reasons: string[] = []
+      if (prContext.filtered) reasons.push('generated files (dist/, .map, .d.ts, lock files) were excluded')
+      if (prContext.lengthTruncated) reasons.push('the remaining diff was truncated to 30k characters')
+
       lines.push(
         '',
-        '## Diff Preview',
-        'The diff below is a **preview** — it may not include all changed files.',
-        'The complete file list above is authoritative. Use `read_file` to examine',
-        'the full content of any file you need to review. Do not assume a file is',
-        'unchanged or missing just because it does not appear in the diff preview.',
+        '## Diff (partial)',
+        `This diff is **incomplete**: ${reasons.join(' and ')}.`,
+        'The complete file list above is authoritative. Do not assume a file is',
+        'unchanged or missing just because it does not appear in the diff below.',
+      )
+      if (hasLocalTools) {
+        lines.push(
+          'Use `read_file` to examine the full content of any file you need to review.',
+        )
+      }
+      lines.push(
         '',
         '```diff',
         prContext.diffPreview,

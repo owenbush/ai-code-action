@@ -158,6 +158,10 @@ The runner environment may contain secrets (`ANTHROPIC_API_KEY`, `GITHUB_TOKEN`,
 
 The PR-event guards (`allow-write-on-pr`, `allow-shell-on-pr`) key off `pull_request` in the event payload, which is absent on `issue_comment` events — even when the comment is on a PR. If you wire this action to an `issue_comment` trigger (e.g. a "/ai" slash command), the guards will not engage. This is lower-risk because the PR diff is also not auto-injected on that event, but you should avoid passing untrusted comment bodies directly as the `prompt`.
 
+### Fork PRs and git tools
+
+On fork PRs with `allow-write-on-pr: true`, `git_commit_and_push` uses `GITHUB_HEAD_REF` as the target branch. Since `origin` points to the base repo (not the fork), the push targets a same-named branch on the base repo. In practice the token usually lacks permission to push to the base repo on fork PRs, so this fails safely.
+
 ### `pull_request_target`
 
 **Never use this action with `pull_request_target`** and secrets from the base repo. That trigger runs on the base branch with base-branch secrets but receives the PR head's content — combining it with this action gives an attacker code execution and secret access.
