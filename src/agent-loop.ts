@@ -36,15 +36,27 @@ function isNoiseFile(diffHeader: string): boolean {
   return DIFF_NOISE_PATTERNS.some((p) => p.test(diffHeader))
 }
 
-function filterDiff(raw: string, maxLength: number): string {
+interface FilterResult {
+  text: string
+  noiseFiltered: boolean
+  lengthTruncated: boolean
+}
+
+function filterDiff(raw: string, maxLength: number): FilterResult {
   const files = raw.split(/(?=^diff --git )/m)
   const filtered: string[] = []
   let length = 0
+  let noiseFiltered = false
+  let lengthTruncated = false
 
   for (const file of files) {
     const firstLine = file.slice(0, file.indexOf('\n'))
-    if (isNoiseFile(firstLine)) continue
+    if (isNoiseFile(firstLine)) {
+      noiseFiltered = true
+      continue
+    }
     if (length + file.length > maxLength) {
+      lengthTruncated = true
       const remaining = maxLength - length
       if (remaining > 200) {
         let chunk = file.slice(0, remaining)
@@ -58,14 +70,14 @@ function filterDiff(raw: string, maxLength: number): string {
     length += file.length
   }
 
-  return filtered.join('')
+  return { text: filtered.join(''), noiseFiltered, lengthTruncated }
 }
 
 interface PRContext {
   fileList: string
   fileCount: number
   diffPreview: string
-  filtered: boolean
+  noiseFiltered: boolean
   lengthTruncated: boolean
 }
 
@@ -96,11 +108,9 @@ async function fetchPRContext(githubToken: string): Promise<PRContext | null> {
       .join('\n')
 
     const rawDiff = String(diffRes.data)
-    const diffPreview = filterDiff(rawDiff, 30_000)
-    const filtered = diffPreview.length < rawDiff.length
-    const lengthTruncated = diffPreview.length >= 30_000
+    const { text: diffPreview, noiseFiltered, lengthTruncated } = filterDiff(rawDiff, 30_000)
 
-    return { fileList, fileCount: allFiles.length, diffPreview, filtered, lengthTruncated }
+    return { fileList, fileCount: allFiles.length, diffPreview, noiseFiltered, lengthTruncated }
   } catch (err) {
     core.warning(`Failed to fetch PR context: ${err}`)
     return null
@@ -141,11 +151,11 @@ function buildDefaultSystem(
       prContext.fileList,
     )
 
-    const incomplete = prContext.filtered || prContext.lengthTruncated
+    const incomplete = prContext.noiseFiltered || prContext.lengthTruncated
 
     if (incomplete) {
       const reasons: string[] = []
-      if (prContext.filtered) reasons.push('generated files (dist/, .map, .d.ts, lock files) were excluded')
+      if (prContext.noiseFiltered) reasons.push('generated files (dist/, .map, .d.ts, lock files) were excluded')
       if (prContext.lengthTruncated) reasons.push('the remaining diff was truncated to 30k characters')
 
       lines.push(

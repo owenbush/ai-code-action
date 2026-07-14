@@ -106342,11 +106342,16 @@ function filterDiff(raw, maxLength) {
     const files = raw.split(/(?=^diff --git )/m);
     const filtered = [];
     let length = 0;
+    let noiseFiltered = false;
+    let lengthTruncated = false;
     for (const file of files) {
         const firstLine = file.slice(0, file.indexOf('\n'));
-        if (isNoiseFile(firstLine))
+        if (isNoiseFile(firstLine)) {
+            noiseFiltered = true;
             continue;
+        }
         if (length + file.length > maxLength) {
+            lengthTruncated = true;
             const remaining = maxLength - length;
             if (remaining > 200) {
                 let chunk = file.slice(0, remaining);
@@ -106360,7 +106365,7 @@ function filterDiff(raw, maxLength) {
         filtered.push(file);
         length += file.length;
     }
-    return filtered.join('');
+    return { text: filtered.join(''), noiseFiltered, lengthTruncated };
 }
 async function fetchPRContext(githubToken) {
     const pr = github_context.payload.pull_request;
@@ -106385,10 +106390,8 @@ async function fetchPRContext(githubToken) {
             .map((f) => `  ${f.status.charAt(0).toUpperCase()} ${f.filename} (+${f.additions} -${f.deletions})`)
             .join('\n');
         const rawDiff = String(diffRes.data);
-        const diffPreview = filterDiff(rawDiff, 30_000);
-        const filtered = diffPreview.length < rawDiff.length;
-        const lengthTruncated = diffPreview.length >= 30_000;
-        return { fileList, fileCount: allFiles.length, diffPreview, filtered, lengthTruncated };
+        const { text: diffPreview, noiseFiltered, lengthTruncated } = filterDiff(rawDiff, 30_000);
+        return { fileList, fileCount: allFiles.length, diffPreview, noiseFiltered, lengthTruncated };
     }
     catch (err) {
         warning(`Failed to fetch PR context: ${err}`);
@@ -106418,10 +106421,10 @@ function buildDefaultSystem(prContext, hasLocalTools) {
     }
     if (prContext) {
         lines.push('', `## Changed Files (${prContext.fileCount})`, prContext.fileList);
-        const incomplete = prContext.filtered || prContext.lengthTruncated;
+        const incomplete = prContext.noiseFiltered || prContext.lengthTruncated;
         if (incomplete) {
             const reasons = [];
-            if (prContext.filtered)
+            if (prContext.noiseFiltered)
                 reasons.push('generated files (dist/, .map, .d.ts, lock files) were excluded');
             if (prContext.lengthTruncated)
                 reasons.push('the remaining diff was truncated to 30k characters');
