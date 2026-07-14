@@ -36,10 +36,10 @@ inputs:
     description: 'Allow the model to call GitHub write tools (create comments, issues, etc.). Default false — the model can only read.'
     default: 'false'
   allow-write-on-pr:
-    description: 'Allow local-write and git tools on pull_request events. Disabled by default because PR content is attacker-controlled on public repos — a malicious diff could instruct the model to overwrite files or push commits.'
+    description: 'Allow local-write and git tools on pull_request and issue_comment events. Disabled by default because PR content is attacker-controlled on public repos — a malicious diff could instruct the model to overwrite files or push commits.'
     default: 'false'
   allow-shell-on-pr:
-    description: 'Allow the shell tool on pull_request events. Disabled by default because PR content is attacker-controlled on public repos.'
+    description: 'Allow the shell tool on pull_request and issue_comment events. Disabled by default because PR content is attacker-controlled on public repos.'
     default: 'false'
 
 outputs:
